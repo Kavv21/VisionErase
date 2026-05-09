@@ -1,0 +1,204 @@
+version: "3.9"
+
+services:
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: visionerase_api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./:/app
+      - model_weights:/app/model_weights
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker_segmentation:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: visionerase_worker_seg
+    command: celery -A workers.celery_app worker -Q segmentation -c 1 --loglevel=info -n seg@%h
+    env_file: .env
+    volumes:
+      - ./:/app
+      - model_weights:/app/model_weights
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
+  worker_inpainting:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: visionerase_worker_inp
+    command: celery -A workers.celery_app worker -Q inpainting -c 1 --loglevel=info -n inp@%h
+    env_file: .env
+    volumes:
+      - ./:/app
+      - model_weights:/app/model_weights
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
+  worker_stitching:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: visionerase_worker_stitch
+    command: celery -A workers.celery_app worker -Q stitching -c 2 --loglevel=info -n stitch@%h
+    env_file: .env
+    volumes:
+      - ./:/app
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
+  worker_quality:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: visionerase_worker_quality
+    command: celery -A workers.celery_app worker -Q quality -c 2 --loglevel=info -n quality@%h
+    env_file: .env
+    volumes:
+      - ./:/app
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: visionerase_redis
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: visionerase_postgres
+    environment:
+      POSTGRES_DB: visionerase
+      POSTGRES_USER: visionerase
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U visionerase"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: visionerase_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: visionerase_prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: visionerase_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: visionerase_flower
+    command: celery -A workers.celery_app flower --port=5555
+    env_file: .env
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
+volumes:
+  redis_data:
+  postgres_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
+  model_weights:
+
+networks:
+  visionerase_net:
+    driver: bridge

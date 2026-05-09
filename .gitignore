@@ -1,0 +1,38 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Environment
+.env
+*.env
+
+# Model weights (too large for git)
+model_weights/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+tmp/
+temp/
+*.tmp
