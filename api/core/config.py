@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     max_video_duration_sec: int = 3600
     max_video_size_mb: int = 2000
 
+    # CORS
+    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+
     # Rate limiting
     rate_limit_per_minute: int = 20
     rate_limit_per_hour: int = 200

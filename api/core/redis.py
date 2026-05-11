@@ -4,7 +4,8 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -42,6 +43,18 @@ async def close_redis_pool() -> None:
 
 async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
     """Yield a Redis client from the shared pool; use as FastAPI Depends()."""
+    if _pool is None:
+        raise RuntimeError("Redis pool not initialized — call init_redis_pool() at startup.")
+    client = aioredis.Redis(connection_pool=_pool)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+@asynccontextmanager
+async def acquire_redis() -> AsyncIterator[aioredis.Redis]:
+    """Async context manager for Redis access outside of FastAPI Depends (e.g. middleware)."""
     if _pool is None:
         raise RuntimeError("Redis pool not initialized — call init_redis_pool() at startup.")
     client = aioredis.Redis(connection_pool=_pool)
