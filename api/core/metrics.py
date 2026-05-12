@@ -46,3 +46,28 @@ UPLOAD_URL_REQUESTS_TOTAL = Counter(
     "visionerase_upload_url_requests_total",
     "Total presigned upload URL requests",
 )
+
+SEGMENT_PROCESSING_TIME = Histogram(
+    "visionerase_segment_processing_seconds",
+    "Time to process one video segment",
+    ["worker_id"],
+    buckets=[10, 30, 60, 120, 300, 600, 1200],
+)
+
+BOUNDARY_FUSION_TIME = Histogram(
+    "visionerase_boundary_fusion_seconds",
+    "Time for BoundaryFusion to correct one boundary",
+    buckets=[0.1, 0.5, 1, 2, 5, 10],
+)
+
+SEGMENTS_TOTAL = Counter(
+    "visionerase_segments_total",
+    "Total video segments processed",
+    ["status"],
+)
+
+BOUNDARY_QUALITY_SCORE = Histogram(
+    "visionerase_boundary_quality_score",
+    "SSIM quality score at segment boundaries after BoundaryFusion",
+    buckets=[0.3, 0.5, 0.65, 0.75, 0.85, 0.9, 0.95, 1.0],
+)

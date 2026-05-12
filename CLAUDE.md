@@ -7,10 +7,12 @@ across every frame with temporal consistency using SAM 2 + ProPainter.
 
 ## Architecture (one paragraph)
 FastAPI gateway → validates request → checks Redis dedup cache →
-enqueues to Redis priority queue → Celery workers (segmentation runs
-SAM 2, tracking runs XMem++, inpainting runs ProPainter, stitching
-merges chunks, quality scores SSIM/PSNR) → results in S3 + Redis →
-frontend polls via WebSocket for live progress.
+enqueues to Redis priority queue → video split into N segments →
+N parallel Celery workers each process their segment
+(SAM2 segmentation → XMem++ tracking → ProPainter inpainting →
+chunk stitching) → BoundaryFusion worker corrects segment boundaries →
+final stitcher combines all segments → result in S3 + Redis →
+frontend receives completion via WebSocket.
 
 ## Folder map
 api/              FastAPI gateway, routers, middleware, models, services
@@ -19,17 +21,21 @@ api/middleware/   rate_limiter, logging
 api/routers/      jobs, websocket, webhooks, health
 api/models/       pydantic schemas
 api/services/     storage (S3), auth
+models/                   proprietary model definitions
+models/boundary_fusion/   BoundaryFusion architecture + inference
 workers/          Celery tasks
 workers/celery_app.py   pipeline chain definition
 workers/segmentation/   SAM 2 tasks
 workers/inpainting/     ProPainter tasks
 workers/stitching/      chunk merge tasks
 workers/quality/        SSIM/PSNR tasks
+workers/boundary/       BoundaryFusion Celery tasks
 pipeline/         CV model layer
 pipeline/pool/    model memory pool (LRU + VRAM management)
 pipeline/tracker/ XMem++ mask propagation
 pipeline/inpainter/ ProPainter inpainting
 pipeline/chunker/ video chunking + seam blending
+pipeline/segmenter/       hierarchical segment splitting
 infra/            Docker, Prometheus, Grafana, Nginx configs
 tests/            unit/, integration/, load/
 frontend/         React + TypeScript + Tailwind + Zustand

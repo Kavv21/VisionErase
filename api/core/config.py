@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     min_ssim_score: float = 0.75
     min_psnr_db: float = 25.0
 
+    # Hierarchical pipeline
+    num_segment_workers: int = 4
+    segment_overlap_frames: int = 150
+    boundary_window_frames: int = 10
+    boundary_fusion_enabled: bool = True
+    boundary_fusion_weights: str = "/app/model_weights/boundary_fusion.pt"
+
 
 @lru_cache
 def get_settings() -> Settings:

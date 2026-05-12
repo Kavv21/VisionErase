@@ -92,6 +92,23 @@ services:
     networks:
       - visionerase_net
 
+  worker_boundary:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: visionerase_worker_boundary
+    command: celery -A workers.celery_app worker -Q boundary -c 2 --loglevel=info -n boundary@%h
+    env_file: .env
+    volumes:
+      - ./:/app
+      - model_weights:/app/model_weights
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+    networks:
+      - visionerase_net
+
   redis:
     image: redis:7.2-alpine
     container_name: visionerase_redis

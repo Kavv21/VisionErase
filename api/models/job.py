@@ -42,6 +42,17 @@ class CreateJobRequest(BaseModel):
     output_format: str | None = None  # None → preserve input container format
 
 
+class SegmentStatus(BaseModel):
+    segment_index: int
+    worker_id: str
+    status: JobStatus
+    start_frame: int
+    end_frame: int
+    progress_pct: float = 0.0
+    ssim_score: float | None = None
+    error: str | None = None
+
+
 class JobResponse(BaseModel):
     job_id: str
     status: JobStatus
@@ -50,6 +61,9 @@ class JobResponse(BaseModel):
     result_s3_key: str | None = None
     error: str | None = None
     cached: bool = False
+    num_segments: int | None = None
+    segments: list[SegmentStatus] = []
+    boundary_fusion_applied: bool = False
 
 
 class UploadURLRequest(BaseModel):
