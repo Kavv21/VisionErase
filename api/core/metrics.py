@@ -36,3 +36,13 @@ HEALTH_CHECKS_TOTAL = Counter(
     "visionerase_health_checks_total",
     "Total health check requests",
 )
+
+JOB_STATUS_REQUESTS_TOTAL = Counter(
+    "visionerase_job_status_requests_total",
+    "Total GET /jobs/{job_id} requests",
+)
+
+UPLOAD_URL_REQUESTS_TOTAL = Counter(
+    "visionerase_upload_url_requests_total",
+    "Total presigned upload URL requests",
+)
