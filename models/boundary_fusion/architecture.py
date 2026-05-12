@@ -1,3 +1,14 @@
+
+"""BoundaryFusion — proprietary model for segment boundary correction.
+
+STATUS: Architecture defined. Weights not yet trained.
+        Train this model in Month 2 Week 5-6 on Kaggle.
+        See docs/boundary_fusion_training.md for training guide.
+
+Proprietary to VisionErase. Do NOT open-source.
+Designed by: Kavish [Your Last Name]
+"""
+
 """BoundaryFusion — proprietary model for segment boundary correction.
 
 Proprietary to VisionErase. Do not open-source.
