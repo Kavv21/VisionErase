@@ -49,3 +49,32 @@ api/core/redis.py         — rate limiter, dedup, pub/sub, priority queue
 pipeline/pool/model_pool.py — LRU model pool, always use this
 workers/celery_app.py     — pipeline chain, task routing
 docker-compose.yml        — all 10 services wired together
+
+## Proprietary Models
+
+### BoundaryFusion
+Our first proprietary model. A lightweight transformer that corrects
+temporal inconsistencies at segment boundaries in the hierarchical
+parallel processing pipeline.
+
+Input:
+  Last 10 frames from Worker N     (10 × H × W × 3)
+  First 10 frames from Worker N+1  (10 × H × W × 3)
+  Corresponding inpainted masks    (20 × H × W × 1)
+
+Architecture:
+  Patch embedding
+  Local window attention (5-frame window)
+  Cross-segment attention between two workers
+  Decoder → 20 corrected boundary frames
+
+Output:
+  20 temporally consistent boundary frames
+
+Training:
+  Dataset: DAVIS + YouTube-VOS + synthetic broken boundaries
+  Hardware: Kaggle T4 GPU
+  Target: Month 2 Week 5-6
+
+This model is proprietary to VisionErase. Never use it as
+open source. It is our key differentiator vs competitors.
