@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 """BoundaryFusion — proprietary model for segment boundary correction.
 
@@ -6,14 +7,7 @@ STATUS: Architecture defined. Weights not yet trained.
         See docs/boundary_fusion_training.md for training guide.
 
 Proprietary to VisionErase. Do NOT open-source.
-Designed by: Kavish [Your Last Name]
 """
-
-"""BoundaryFusion — proprietary model for segment boundary correction.
-
-Proprietary to VisionErase. Do not open-source.
-"""
-from __future__ import annotations
 
 import math
 
