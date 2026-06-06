@@ -71,3 +71,14 @@ BOUNDARY_QUALITY_SCORE = Histogram(
     "SSIM quality score at segment boundaries after BoundaryFusion",
     buckets=[0.3, 0.5, 0.65, 0.75, 0.85, 0.9, 0.95, 1.0],
 )
+
+CHUNKS_CREATED_TOTAL = Counter(
+    "visionerase_chunks_created_total",
+    "Total video chunks extracted and uploaded to S3 for inpainting",
+)
+
+CHUNK_EXTRACTION_SECONDS = Histogram(
+    "visionerase_chunk_extraction_seconds",
+    "Time to extract one video chunk via ffmpeg",
+    buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+)
