@@ -82,3 +82,20 @@ CHUNK_EXTRACTION_SECONDS = Histogram(
     "Time to extract one video chunk via ffmpeg",
     buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
 )
+
+MODEL_LOAD_TIME = Histogram(
+    "visionerase_model_load_time_seconds",
+    "Time to load a CV model into the pool",
+    ["model"],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
+)
+
+MODEL_POOL_SIZE = Gauge(
+    "visionerase_model_pool_size",
+    "Number of CV models currently loaded in the pool",
+)
+
+VRAM_USAGE = Gauge(
+    "visionerase_vram_usage_gb",
+    "Current VRAM usage in gigabytes (CUDA only)",
+)
