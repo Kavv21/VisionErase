@@ -11,8 +11,14 @@ from unittest import mock
 import pytest
 from starlette.testclient import TestClient
 
+import uuid
+
+from fastapi import HTTPException, status
+
+from api.core.auth import get_current_user
 from api.core.redis import get_redis
 from api.main import app
+from api.models.user import User
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────
 
@@ -52,17 +58,28 @@ _FAKE_UPLOAD_URL_RESULT = {
 }
 
 
+_FAKE_USER = User(
+    id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+    email="test@example.com",
+    display_name="Test User",
+)
+
+
 @pytest.fixture
 def client():
-    """TestClient with all infrastructure (Redis pool, DB, S3) mocked out.
+    """TestClient with all infrastructure (Redis pool, DB, S3, Auth) mocked out.
 
-    The get_redis dependency is overridden so no Redis pool is needed.
-    Startup/shutdown lifecycle hooks are stubbed so the app starts cleanly.
+    The get_redis and get_current_user dependencies are overridden so no
+    real connections are needed.
     """
     async def fake_get_redis():
         yield mock.AsyncMock()
 
+    async def fake_get_current_user():
+        return _FAKE_USER
+
     app.dependency_overrides[get_redis] = fake_get_redis
+    app.dependency_overrides[get_current_user] = fake_get_current_user
 
     with (
         mock.patch("api.core.redis.init_redis_pool"),
@@ -74,6 +91,7 @@ def client():
             yield c
 
     app.dependency_overrides.pop(get_redis, None)
+    app.dependency_overrides.pop(get_current_user, None)
 
 
 # ── POST /api/v1/jobs/ — job creation ─────────────────────────────────────────
@@ -368,3 +386,71 @@ class TestUploadUrl:
         ):
             resp = client.post("/api/v1/jobs/upload-url", json=payload)
         assert resp.status_code == 200
+
+
+# ── POST /api/v1/jobs/upload — direct multipart upload ───────────────────────
+
+@pytest.fixture
+def no_auth_client():
+    """TestClient where get_current_user always raises 401 (unauthenticated)."""
+    async def fake_get_redis():
+        yield mock.AsyncMock()
+
+    async def raise_401():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    app.dependency_overrides[get_redis] = fake_get_redis
+    app.dependency_overrides[get_current_user] = raise_401
+
+    with (
+        mock.patch("api.core.redis.init_redis_pool"),
+        mock.patch("api.core.redis.close_redis_pool", new_callable=mock.AsyncMock),
+        mock.patch("api.core.database.init_db", new_callable=mock.AsyncMock),
+        mock.patch("api.core.database.close_db", new_callable=mock.AsyncMock),
+    ):
+        with TestClient(app) as c:
+            yield c
+
+    app.dependency_overrides.pop(get_redis, None)
+    app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.mark.unit
+class TestUploadVideo:
+    def test_authenticated_upload_valid_file_returns_200_with_s3_key(
+        self, client: TestClient
+    ):
+        """An authenticated upload of a valid video file must return 200 with s3_key."""
+        mock_s3 = mock.MagicMock()
+        with mock.patch("api.routers.jobs._s3_client", return_value=mock_s3):
+            resp = client.post(
+                "/api/v1/jobs/upload",
+                files={"file": ("clip.mp4", b"fake video bytes", "video/mp4")},
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "s3_key" in body
+        assert body["s3_key"].startswith("uploads/")
+        assert body["s3_key"].endswith("/clip.mp4")
+        assert "size_bytes" in body
+        mock_s3.upload_fileobj.assert_called_once()
+
+    def test_unauthenticated_upload_returns_401(self, no_auth_client: TestClient):
+        """A request without a valid Bearer token must be rejected with 401."""
+        resp = no_auth_client.post(
+            "/api/v1/jobs/upload",
+            files={"file": ("clip.mp4", b"fake video bytes", "video/mp4")},
+        )
+        assert resp.status_code == 401
+
+    def test_wrong_content_type_returns_415(self, client: TestClient):
+        """Uploading a non-video file type must be rejected with 415."""
+        resp = client.post(
+            "/api/v1/jobs/upload",
+            files={"file": ("doc.pdf", b"pdf bytes", "application/pdf")},
+        )
+        assert resp.status_code == 415

@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     s3_endpoint_url: str | None = None
     aws_access_key_id: str
     aws_secret_access_key: str
-
+    s3_public_endpoint_url: str | None = None  # browser-facing MinIO URL
     # CV device & model pool
     device: str = "cpu"
     model_cache_dir: str = "/app/model_weights"
@@ -54,6 +54,11 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+
+    # Google OAuth (optional — app boots fine without these set)
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
+    google_redirect_uri: str | None = None
 
     # Rate limiting
     rate_limit_per_minute: int = 20

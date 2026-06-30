@@ -99,3 +99,23 @@ VRAM_USAGE = Gauge(
     "visionerase_vram_usage_gb",
     "Current VRAM usage in gigabytes (CUDA only)",
 )
+
+AUTH_REGISTRATIONS_TOTAL = Counter(
+    "visionerase_auth_registrations_total",
+    "Total successful user registrations",
+)
+
+AUTH_LOGINS_TOTAL = Counter(
+    "visionerase_auth_logins_total",
+    "Total successful user logins",
+)
+
+SEGMENT_PREVIEW_REQUESTS_TOTAL = Counter(
+    "visionerase_segment_preview_requests_total",
+    "Total segment preview requests (stub mode, SAM 2 not yet integrated)",
+)
+
+UPLOAD_REQUESTS_TOTAL = Counter(
+    "visionerase_upload_requests_total",
+    "Total direct video upload requests via multipart POST",
+)

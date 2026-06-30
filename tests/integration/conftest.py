@@ -22,6 +22,8 @@ os.environ["DATABASE_URL"] = (
 )
 os.environ["S3_ENDPOINT_URL"] = "http://localhost:9000"
 
+import uuid
+
 import boto3
 import pytest
 import pytest_asyncio
@@ -32,8 +34,16 @@ from httpx import ASGITransport, AsyncClient
 from starlette.testclient import TestClient
 
 from api.core import redis as redis_module
+from api.core.auth import get_current_user
 from api.core.config import get_settings
 from api.main import app
+from api.models.user import User
+
+_INTEG_USER = User(
+    id=uuid.UUID("00000000-0000-0000-0000-000000000099"),
+    email="integ@example.com",
+    display_name="Integ User",
+)
 
 
 # ── Session-level service bootstrapping ───────────────────────────────────────
@@ -71,7 +81,14 @@ async def client() -> AsyncClient:
     here.  Each async test runs in its own event loop (pytest-asyncio STRICT
     mode); re-initialising the pool per test prevents stale connections from
     a previous loop from leaking into the next test.
+
+    Auth is bypassed with a stub user so integration tests exercise the real
+    Redis/Postgres/MinIO path without needing a user row in the database.
     """
+    async def _stub_auth():
+        return _INTEG_USER
+
+    app.dependency_overrides[get_current_user] = _stub_auth
     redis_module.init_redis_pool()
     try:
         async with AsyncClient(
@@ -82,6 +99,7 @@ async def client() -> AsyncClient:
             yield ac
     finally:
         await redis_module.close_redis_pool()
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 @pytest_asyncio.fixture()
@@ -100,5 +118,12 @@ def ws_client() -> TestClient:
     initialises its own Redis pool bound to the TestClient's event loop.
     The pool is closed when the context manager exits.
     """
-    with TestClient(app, raise_server_exceptions=True) as tc:
-        yield tc
+    async def _stub_auth():
+        return _INTEG_USER
+
+    app.dependency_overrides[get_current_user] = _stub_auth
+    try:
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            yield tc
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)

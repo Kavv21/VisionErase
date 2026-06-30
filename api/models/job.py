@@ -66,6 +66,17 @@ class JobResponse(BaseModel):
     boundary_fusion_applied: bool = False
 
 
+class SegmentPreviewRequest(BaseModel):
+    video_s3_key: str
+    point: MaskPoint
+    frame_index: int = 0
+
+
+class SegmentPreviewResponse(BaseModel):
+    mask_points: list[MaskPoint]
+    stub: bool = True
+
+
 class UploadURLRequest(BaseModel):
     filename: str
     content_type: str = "video/mp4"
@@ -76,3 +87,8 @@ class UploadURLResponse(BaseModel):
     upload_url: str
     s3_key: str
     expires_in: int = Field(default=3600)
+
+
+class VideoUploadResponse(BaseModel):
+    s3_key: str
+    size_bytes: int
