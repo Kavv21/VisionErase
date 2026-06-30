@@ -11,6 +11,7 @@ import Settings from './pages/Settings'
 import AuthCallback from './pages/AuthCallback'
 import MaskEditor from './pages/MaskEditor'
 import JobProgress from './pages/JobProgress'
+import Result from './pages/Result'
 import { useAuthStore } from './store/authStore'
 
 function AppRoutes() {
@@ -26,6 +27,7 @@ function AppRoutes() {
       <Route path="/auth/callback" element={<AuthCallback />} />
       <Route path="/editor" element={<MaskEditor />} />
       <Route path="/progress/:jobId" element={<JobProgress />} />
+      <Route path="/result/:jobId" element={<Result />} />
     </Routes>
   )
 }

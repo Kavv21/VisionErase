@@ -57,5 +57,12 @@ async def generate_download_url(s3_key: str, expires_in: int = _PRESIGNED_EXPIRE
         Params={"Bucket": settings.s3_bucket, "Key": s3_key},
         ExpiresIn=expires_in,
     )
+    # Replace internal Docker hostname with public-facing URL
+    # so the browser can actually reach MinIO directly
+    if settings.s3_public_endpoint_url and settings.s3_endpoint_url:
+        url = url.replace(
+            settings.s3_endpoint_url,
+            settings.s3_public_endpoint_url,
+        )
     log.info("presigned_download_url_generated", s3_key=s3_key, expires_in=expires_in)
     return url

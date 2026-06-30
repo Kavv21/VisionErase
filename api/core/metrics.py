@@ -119,3 +119,8 @@ UPLOAD_REQUESTS_TOTAL = Counter(
     "visionerase_upload_requests_total",
     "Total direct video upload requests via multipart POST",
 )
+
+DOWNLOAD_URL_REQUESTS_TOTAL = Counter(
+    "visionerase_download_url_requests_total",
+    "Total presigned result download URL requests",
+)

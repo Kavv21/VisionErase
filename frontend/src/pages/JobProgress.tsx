@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuthStore } from '../store/authStore'
+import { apiGetJob } from '../api/jobs'
 
 // Message shapes the /ws/{job_id} endpoint actually emits (see api/routers/websocket.py)
 type WsMsg =
@@ -116,6 +117,43 @@ export default function JobProgress() {
       wsRef.current?.close()
     }
   }, [jobId, isAuthenticated]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Polling fallback: the WebSocket completion event can be missed if the
+  // browser was refreshed or the connection dropped, so also poll status
+  // directly until the job finishes.
+  useEffect(() => {
+    if (!jobId || !isAuthenticated || isDone) return
+
+    const interval = setInterval(async () => {
+      try {
+        const data = await apiGetJob(jobId)
+        if (data.status === 'completed') {
+          setStage('completed')
+          setPct(100)
+          setResultKey(data.result_s3_key ?? null)
+          setIsDone(true)
+        } else if (data.status === 'failed') {
+          setWsError(data.error ?? 'An error occurred')
+          setIsDone(true)
+        } else {
+          setStage(data.status)
+          setPct(data.progress_pct)
+        }
+      } catch {
+        // transient polling error — the next tick will retry
+      }
+    }, 5000)
+
+    return () => clearInterval(interval)
+  }, [jobId, isAuthenticated, isDone])
+
+  // Once the job is confirmed complete (via either WebSocket or polling),
+  // move on to the result page automatically.
+  useEffect(() => {
+    if (isDone && !wsError && jobId) {
+      navigate(`/result/${jobId}`)
+    }
+  }, [isDone, wsError, jobId, navigate])
 
   if (!isAuthenticated) return null
 

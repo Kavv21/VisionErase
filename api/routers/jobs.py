@@ -12,6 +12,7 @@ from redis.asyncio import Redis
 from api.core.auth import get_current_user
 from api.core.config import get_settings
 from api.core.metrics import (
+    DOWNLOAD_URL_REQUESTS_TOTAL,
     JOB_STATUS_REQUESTS_TOTAL,
     JOB_SUBMISSIONS_TOTAL,
     UPLOAD_REQUESTS_TOTAL,
@@ -27,6 +28,7 @@ from api.core.redis import (
 )
 from api.models.job import (
     CreateJobRequest,
+    DownloadUrlResponse,
     JobPriority,
     JobResponse,
     JobStatus,
@@ -35,7 +37,7 @@ from api.models.job import (
     VideoUploadResponse,
 )
 from api.models.user import User
-from api.services.storage import _s3_client, generate_upload_url
+from api.services.storage import _PRESIGNED_EXPIRES_IN, _s3_client, generate_download_url, generate_upload_url
 
 log = structlog.get_logger(__name__)
 router = APIRouter(tags=["jobs"])
@@ -137,6 +139,37 @@ async def get_job(job_id: str, redis: RedisDep) -> JobResponse:
         error=status_data.get("error"),
         cached=status_data.get("cached", False),
     )
+
+
+@router.get("/{job_id}/download", response_model=DownloadUrlResponse)
+async def download_job_result(
+    job_id: str,
+    redis: RedisDep,
+    _current_user: AuthDep,
+) -> DownloadUrlResponse:
+    """Return a presigned download URL for a completed job's result video."""
+    DOWNLOAD_URL_REQUESTS_TOTAL.inc()
+    bound_log = log.bind(job_id=job_id)
+
+    status_data = await get_job_status(redis, job_id)
+    if status_data is None:
+        bound_log.info("job_not_found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    if JobStatus(status_data["status"]) != JobStatus.COMPLETED:
+        bound_log.info("job_not_complete", job_status=status_data["status"])
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Job not complete yet"
+        )
+
+    result_s3_key = status_data.get("result_s3_key")
+    if result_s3_key is None:
+        bound_log.info("no_result_available")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No result available")
+
+    download_url = await generate_download_url(result_s3_key)
+    bound_log.info("download_url_issued")
+    return DownloadUrlResponse(download_url=download_url, expires_in=_PRESIGNED_EXPIRES_IN)
 
 
 @router.post("/upload-url", response_model=UploadURLResponse)

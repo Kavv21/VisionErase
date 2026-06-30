@@ -46,6 +46,7 @@ export default function MaskEditor() {
 
   const frameCanvasRef = useRef<HTMLCanvasElement>(null)
   const maskCanvasRef = useRef<HTMLCanvasElement>(null)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
 
   const [tool, setTool] = useState<Tool>('point')
   const [frameReady, setFrameReady] = useState(false)
@@ -57,6 +58,8 @@ export default function MaskEditor() {
   const [showStubBadge, setShowStubBadge] = useState(false)
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [totalFrames, setTotalFrames] = useState(0)
+  const [currentFrame, setCurrentFrame] = useState(0)
 
   // Auth + precondition guard
   useEffect(() => {
@@ -69,7 +72,7 @@ export default function MaskEditor() {
     }
   }, [isAuthenticated, file, s3Key, navigate])
 
-  // Extract first frame via an off-screen video element
+  // Extract first frame via an off-screen video element, kept alive for scrubbing
   useEffect(() => {
     if (!file || !frameCanvasRef.current || !maskCanvasRef.current) return
 
@@ -78,24 +81,36 @@ export default function MaskEditor() {
     video.src = url
     video.muted = true
     video.preload = 'metadata'
+    videoRef.current = video
 
+    let initialized = false
+
+    // Redraws only the video-frame canvas, never the mask overlay, so
+    // scrubbing across frames doesn't disturb whatever the user has painted.
     const onSeeked = () => {
       const frameCanvas = frameCanvasRef.current
-      const maskCanvas = maskCanvasRef.current
-      if (!frameCanvas || !maskCanvas) return
+      if (!frameCanvas) return
 
       const ctx = frameCanvas.getContext('2d')
       if (!ctx) return
 
-      frameCanvas.width = video.videoWidth
-      frameCanvas.height = video.videoHeight
-      maskCanvas.width = video.videoWidth
-      maskCanvas.height = video.videoHeight
+      if (!initialized) {
+        const maskCanvas = maskCanvasRef.current
+        frameCanvas.width = video.videoWidth
+        frameCanvas.height = video.videoHeight
+        if (maskCanvas) {
+          maskCanvas.width = video.videoWidth
+          maskCanvas.height = video.videoHeight
+        }
+        setVideoSize({ w: video.videoWidth, h: video.videoHeight })
+        // No exact client-side fps, so estimate frame count from duration.
+        const estimatedFrames = Math.max(1, Math.round(video.duration * 30))
+        setTotalFrames(estimatedFrames)
+        setFrameReady(true)
+        initialized = true
+      }
 
-      ctx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight)
-      setVideoSize({ w: video.videoWidth, h: video.videoHeight })
-      setFrameReady(true)
-      URL.revokeObjectURL(url)
+      ctx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height)
     }
 
     const onMeta = () => {
@@ -109,9 +124,20 @@ export default function MaskEditor() {
     return () => {
       video.removeEventListener('loadedmetadata', onMeta)
       video.removeEventListener('seeked', onSeeked)
+      videoRef.current = null
       URL.revokeObjectURL(url)
     }
   }, [file])
+
+  const handleScrub = useCallback(
+    (newFrame: number) => {
+      setCurrentFrame(newFrame)
+      const video = videoRef.current
+      if (!video || totalFrames <= 0 || !Number.isFinite(video.duration)) return
+      video.currentTime = (newFrame / totalFrames) * video.duration
+    },
+    [totalFrames]
+  )
 
   // Draw the returned preview polygon on the mask canvas
   const drawPreviewPolygon = useCallback((points: MaskPoint[]) => {
@@ -149,7 +175,7 @@ export default function MaskEditor() {
       )
 
       try {
-        const response = await apiSegmentPreview(s3Key, videoPoint, 0)
+        const response = await apiSegmentPreview(s3Key, videoPoint, currentFrame)
         drawPreviewPolygon(response.mask_points)
         if (response.stub) setShowStubBadge(true)
         // Add the clicked point to the mask data
@@ -161,7 +187,7 @@ export default function MaskEditor() {
         setPreviewClickPos(null)
       }
     },
-    [s3Key, frameReady, videoSize, drawPreviewPolygon]
+    [s3Key, frameReady, videoSize, currentFrame, drawPreviewPolygon]
   )
 
   const handleBrushMove = useCallback(
@@ -228,7 +254,7 @@ export default function MaskEditor() {
     try {
       const result = await apiCreateJob(s3Key, {
         points: maskPoints,
-        frame_index: 0,
+        frame_index: currentFrame,
       })
       setJobId(result.job_id)
       navigate(`/progress/${result.job_id}`)
@@ -263,44 +289,62 @@ export default function MaskEditor() {
         )}
 
         <div className="flex gap-4 items-start">
-          {/* Canvas area */}
-          <div className="flex-1 bg-stone-900 rounded-2xl overflow-hidden relative">
-            {!frameReady && (
-              <div className="absolute inset-0 flex items-center justify-center text-stone-400 text-sm">
-                Loading first frame…
-              </div>
-            )}
-            <div className="relative" style={{ lineHeight: 0 }}>
-              {/* Frame canvas */}
-              <canvas
-                ref={frameCanvasRef}
-                className="w-full block"
-                style={{ display: frameReady ? 'block' : 'none' }}
-              />
-              {/* Mask overlay canvas — exactly stacked on top */}
-              <canvas
-                ref={maskCanvasRef}
-                className="w-full block absolute inset-0"
-                style={{
-                  display: frameReady ? 'block' : 'none',
-                  cursor: tool === 'point' ? 'crosshair' : tool === 'eraser' ? 'cell' : 'default',
-                }}
-                onPointerDown={handlePointerDown}
-                onPointerMove={handlePointerMove}
-                onPointerUp={handlePointerUp}
-                onPointerLeave={handlePointerUp}
-              />
-              {/* Loading dot at click position for point tool */}
-              {previewLoading && previewClickPos && (
-                <div
-                  className="absolute w-5 h-5 rounded-full border-2 border-red-400 border-t-transparent animate-spin"
-                  style={{
-                    left: previewClickPos.x - 10,
-                    top: previewClickPos.y - 10,
-                    pointerEvents: 'none',
-                  }}
-                />
+          {/* Canvas + scrubber column */}
+          <div className="flex-1 flex flex-col gap-3">
+            <div className="bg-stone-900 rounded-2xl overflow-hidden relative">
+              {!frameReady && (
+                <div className="absolute inset-0 flex items-center justify-center text-stone-400 text-sm">
+                  Loading first frame…
+                </div>
               )}
+              <div className="relative" style={{ lineHeight: 0 }}>
+                {/* Frame canvas */}
+                <canvas
+                  ref={frameCanvasRef}
+                  className="w-full block"
+                  style={{ display: frameReady ? 'block' : 'none' }}
+                />
+                {/* Mask overlay canvas — exactly stacked on top */}
+                <canvas
+                  ref={maskCanvasRef}
+                  className="w-full block absolute inset-0"
+                  style={{
+                    display: frameReady ? 'block' : 'none',
+                    cursor: tool === 'point' ? 'crosshair' : tool === 'eraser' ? 'cell' : 'default',
+                  }}
+                  onPointerDown={handlePointerDown}
+                  onPointerMove={handlePointerMove}
+                  onPointerUp={handlePointerUp}
+                  onPointerLeave={handlePointerUp}
+                />
+                {/* Loading dot at click position for point tool */}
+                {previewLoading && previewClickPos && (
+                  <div
+                    className="absolute w-5 h-5 rounded-full border-2 border-red-400 border-t-transparent animate-spin"
+                    style={{
+                      left: previewClickPos.x - 10,
+                      top: previewClickPos.y - 10,
+                      pointerEvents: 'none',
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+
+            {/* Frame scrubber */}
+            <div className="bg-white rounded-2xl shadow-sm border border-stone-100 p-4">
+              <input
+                type="range"
+                min={0}
+                max={Math.max(totalFrames - 1, 0)}
+                value={currentFrame}
+                disabled={!frameReady || totalFrames <= 1}
+                onChange={(e) => handleScrub(Number(e.target.value))}
+                className="w-full accent-red-600 disabled:opacity-50"
+              />
+              <p className="text-xs text-stone-500 text-center mt-2 font-medium">
+                Frame {currentFrame} / {totalFrames}
+              </p>
             </div>
           </div>
 

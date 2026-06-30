@@ -92,3 +92,8 @@ class UploadURLResponse(BaseModel):
 class VideoUploadResponse(BaseModel):
     s3_key: str
     size_bytes: int
+
+
+class DownloadUrlResponse(BaseModel):
+    download_url: str
+    expires_in: int = Field(default=3600)

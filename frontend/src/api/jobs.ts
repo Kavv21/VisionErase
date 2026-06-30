@@ -31,6 +31,21 @@ export interface CreateJobResponse {
   cached: boolean
 }
 
+export interface JobStatusResponse {
+  job_id: string
+  status: string
+  progress_pct: number
+  created_at: string
+  result_s3_key: string | null
+  error: string | null
+  cached: boolean
+}
+
+export interface DownloadUrlResponse {
+  download_url: string
+  expires_in: number
+}
+
 export async function apiRequestUploadUrl(
   filename: string,
   contentType: string,
@@ -87,5 +102,15 @@ export async function apiCreateJob(
     video_s3_key: videoS3Key,
     mask,
   })
+  return data
+}
+
+export async function apiGetJob(jobId: string): Promise<JobStatusResponse> {
+  const { data } = await apiClient.get<JobStatusResponse>(`/api/v1/jobs/${jobId}`)
+  return data
+}
+
+export async function apiGetJobDownload(jobId: string): Promise<DownloadUrlResponse> {
+  const { data } = await apiClient.get<DownloadUrlResponse>(`/api/v1/jobs/${jobId}/download`)
   return data
 }

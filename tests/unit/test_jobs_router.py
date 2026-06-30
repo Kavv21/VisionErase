@@ -312,6 +312,37 @@ class TestGetJob:
         assert body["error"] == "Segmentation model timed out"
 
 
+# ── GET /api/v1/jobs/{job_id}/download — presigned result download URL ───────
+
+@pytest.mark.unit
+class TestDownloadJobResult:
+    def test_unauthenticated_returns_401(self, no_auth_client: TestClient):
+        """A request without a valid Bearer token must be rejected with 401."""
+        resp = no_auth_client.get("/api/v1/jobs/test-job-id-1234/download")
+        assert resp.status_code == 401
+
+    def test_unknown_job_returns_404(self, client: TestClient):
+        """GET /{job_id}/download must return 404 when the job is not found in Redis."""
+        with mock.patch(
+            "api.routers.jobs.get_job_status",
+            new_callable=mock.AsyncMock,
+            return_value=None,
+        ):
+            resp = client.get("/api/v1/jobs/no-such-job/download")
+        assert resp.status_code == 404
+
+    def test_incomplete_job_returns_400(self, client: TestClient):
+        """A job that has not reached COMPLETED status must return 400."""
+        with mock.patch(
+            "api.routers.jobs.get_job_status",
+            new_callable=mock.AsyncMock,
+            return_value=_FAKE_JOB_STATUS,
+        ):
+            resp = client.get("/api/v1/jobs/test-job-id-1234/download")
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "Job not complete yet"
+
+
 # ── POST /api/v1/jobs/upload-url — presigned URL generation ───────────────────
 
 @pytest.mark.unit
