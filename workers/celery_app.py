@@ -47,6 +47,19 @@ celery_app.autodiscover_tasks([
     "workers.boundary",
 ])
 
+# ── Worker startup signal ──────────────────────────────────────────────────────
+
+from celery.signals import worker_process_init
+
+@worker_process_init.connect
+def init_worker_redis(**kwargs):
+    """Initialize Redis pool in each Celery worker process at startup."""
+    from api.core.redis import init_redis_pool
+    init_redis_pool()
+    log.info("worker_redis_pool_initialized")
+
+
+
 
 def get_celery_app() -> Celery:
     """Return the configured Celery application instance."""

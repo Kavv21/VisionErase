@@ -38,6 +38,7 @@ from api.models.job import (
 )
 from api.models.user import User
 from api.services.storage import _PRESIGNED_EXPIRES_IN, _s3_client, generate_download_url, generate_upload_url
+from workers.segmentation.tasks import segment_first_frame
 
 log = structlog.get_logger(__name__)
 router = APIRouter(tags=["jobs"])
@@ -105,7 +106,12 @@ async def create_job(
     # URGENT=0 → score=3, BATCH=3 → score=0 so ZPOPMAX always pops most urgent.
     queue_score = _MAX_PRIORITY_SCORE - int(req.priority)
     await enqueue_job(redis, job_id, queue_score, payload)
-
+    # Dispatch to Celery segmentation worker
+    segment_first_frame.apply_async(
+    args=[job_id, req.video_s3_key, mask_dict],
+    queue="segmentation",
+    priority=int(req.priority),
+    )
     bound_log.info("job_accepted", priority=req.priority.name)
     JOB_SUBMISSIONS_TOTAL.labels(outcome="accepted").inc()
 
