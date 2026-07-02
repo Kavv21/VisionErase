@@ -137,14 +137,16 @@ async def get_job(job_id: str, redis: RedisDep) -> JobResponse:
 
     bound_log.debug("job_status_fetched", job_status=status_data.get("status"))
     return JobResponse(
-        job_id=status_data["job_id"],
-        status=JobStatus(status_data["status"]),
-        progress_pct=status_data.get("progress_pct", 0.0),
-        created_at=datetime.fromisoformat(status_data["created_at"]),
-        result_s3_key=status_data.get("result_s3_key"),
-        error=status_data.get("error"),
-        cached=status_data.get("cached", False),
-    )
+   	job_id=status_data.get("job_id", job_id),
+    	status=JobStatus(status_data.get("status", "pending")),
+    	progress_pct=status_data.get("progress_pct", 0.0),
+    	created_at=datetime.fromisoformat(
+        	status_data.get("created_at", datetime.now(timezone.utc).isoformat())
+   	 ),
+    	result_s3_key=status_data.get("result_s3_key"),
+    	error=status_data.get("error"),
+    	cached=status_data.get("cached", False),
+ )
 
 
 @router.get("/{job_id}/download", response_model=DownloadUrlResponse)

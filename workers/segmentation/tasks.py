@@ -12,6 +12,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from api.core.config import get_settings
 from api.core.metrics import SEGMENTS_TOTAL
 from api.core.redis import acquire_redis, publish_progress, set_job_status
+from api.models.job import JobStatus
 
 log = structlog.get_logger(__name__)
 
@@ -50,6 +51,9 @@ def segment_first_frame(
         loop.run_until_complete(
             _publish(job_id, {"stage": "segmenting", "pct": 0})
         )
+        loop.run_until_complete(
+            _update_status(job_id, JobStatus.SEGMENTING, None)
+        )
         SEGMENTS_TOTAL.labels(status="segmentation_started").inc()
 
         s3 = _make_s3_client(settings)
@@ -82,6 +86,11 @@ def segment_first_frame(
             _publish(job_id, {"stage": "segmenting", "pct": 100})
         )
         SEGMENTS_TOTAL.labels(status=f"segmentation_{status}").inc()
+
+        track_masks.apply_async(
+            args=[job_id, segment_s3_key, mask_s3_key],
+            queue="segmentation",
+        )
 
         return {
             "job_id": job_id,
@@ -134,17 +143,27 @@ def track_masks(
         loop.run_until_complete(
             _publish(job_id, {"stage": "tracking", "pct": 0})
         )
-
+        loop.run_until_complete(
+            _update_status(job_id, JobStatus.TRACKING, None)
+        )
         SEGMENTS_TOTAL.labels(status="tracking_started").inc()
 
         loop.run_until_complete(
             _publish(job_id, {"stage": "tracking", "pct": 100})
         )
 
+        tracked_masks_s3_key = f"jobs/{job_id}/masks/tracked_stub.npy"
+
+        from workers.inpainting.tasks import inpaint_segment
+        inpaint_segment.apply_async(
+            args=[job_id, segment_s3_key, tracked_masks_s3_key],
+            queue="inpainting",
+        )
+
         return {
             "job_id": job_id,
             "segment_s3_key": segment_s3_key,
-            "tracked_masks_s3_key": f"jobs/{job_id}/masks/tracked_stub.npy",
+            "tracked_masks_s3_key": tracked_masks_s3_key,
             "status": "stub",
         }
 
@@ -241,10 +260,35 @@ def _run_sam2_segmentation(
 
 
 async def _publish(job_id: str, data: dict) -> None:
-    async with acquire_redis() as redis:
-        await publish_progress(redis, job_id, data)
+    from redis import asyncio as _aioredis
+    import json as _json
+    from api.core.config import get_settings as _get_settings
+    _s = _get_settings()
+    _r = _aioredis.Redis.from_url(_s.redis_url, decode_responses=True)
+    try:
+        channel = f"progress:{job_id}"
+        message = _json.dumps({"type": "progress", **data})
+        await _r.publish(channel, message)
+    finally:
+        await _r.aclose()
 
 
-async def _update_status(job_id: str, status: str, error: str) -> None:
-    async with acquire_redis() as redis:
-        await set_job_status(redis, job_id, {"status": status, "error": error})
+async def _update_status(job_id: str, status: str, error: str | None = None, extra: dict | None = None) -> None:
+    import json as _json
+    from redis import asyncio as _aioredis
+    from api.core.config import get_settings as _get_settings
+    _s = _get_settings()
+    status_str = status.value if hasattr(status, "value") else str(status)
+    _r = _aioredis.Redis.from_url(_s.redis_url, decode_responses=True)
+    try:
+        key = f"job:status:{job_id}"
+        existing_raw = await _r.get(key)
+        existing = _json.loads(existing_raw) if existing_raw else {}
+        existing["status"] = status_str
+        if error is not None:
+            existing["error"] = error
+        if extra:
+            existing.update(extra)
+        await _r.setex(key, _s.redis_result_ttl, _json.dumps(existing))
+    finally:
+        await _r.aclose()
