@@ -16,6 +16,11 @@ from api.models.job import JobStatus
 
 log = structlog.get_logger(__name__)
 
+MAX_TRACKING_FRAMES = 30    # cap to avoid timeout on CPU
+TRACKING_WIDTH      = 854   # resize to 480p
+TRACKING_HEIGHT     = 480
+
+
 # Import celery_app lazily to avoid circular imports at module load time.
 from workers.celery_app import celery_app  # noqa: E402
 
@@ -121,8 +126,8 @@ def segment_first_frame(
     bind=True,
     queue="segmentation",
     max_retries=2,
-    soft_time_limit=300,
-    time_limit=360,
+    soft_time_limit=600,
+    time_limit=720,
     name="workers.segmentation.tasks.track_masks",
 )
 def track_masks(
@@ -131,9 +136,11 @@ def track_masks(
     segment_s3_key: str,
     mask_s3_key: str,
 ) -> dict[str, Any]:
-    """Stub: propagate masks across frames with XMem++ (Month 2 integration)."""
+    """Propagate the SAM2 first-frame mask across all frames with XMem."""
+    settings = get_settings()
     bound_log = log.bind(
         job_id=job_id,
+        segment_s3_key=segment_s3_key,
         task_id=self.request.id,
     )
     bound_log.info("tracking_started")
@@ -148,23 +155,51 @@ def track_masks(
         )
         SEGMENTS_TOTAL.labels(status="tracking_started").inc()
 
+        s3 = _make_s3_client(settings)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "segment.mp4")
+            mask_path = os.path.join(tmp, "mask.npy")
+            s3.download_file(settings.s3_bucket, segment_s3_key, video_path)
+            s3.download_file(settings.s3_bucket, mask_s3_key, mask_path)
+
+            mask = np.load(mask_path)  # (H, W), values 0 or 255
+            mask_binary = (mask > 127).astype(np.uint8)
+
+            frames = _extract_all_frames(video_path)
+            if not frames:
+                raise RuntimeError(f"no frames decoded from {segment_s3_key}")
+            bound_log.info("frames_extracted", num_frames=len(frames))
+
+            # 50%: video + mask loaded, model about to run
+            loop.run_until_complete(
+                _publish(job_id, {"stage": "tracking", "pct": 50})
+            )
+
+            tracked_array = _run_xmem_tracking(frames, mask_binary, settings, bound_log)
+
+            tracked_key = f"jobs/{job_id}/masks/tracked_masks.npy"
+            tracked_path = os.path.join(tmp, "tracked_masks.npy")
+            np.save(tracked_path, tracked_array)
+            s3.upload_file(tracked_path, settings.s3_bucket, tracked_key)
+
         loop.run_until_complete(
             _publish(job_id, {"stage": "tracking", "pct": 100})
         )
-
-        tracked_masks_s3_key = f"jobs/{job_id}/masks/tracked_stub.npy"
+        SEGMENTS_TOTAL.labels(status="tracking_real").inc()
 
         from workers.inpainting.tasks import inpaint_segment
         inpaint_segment.apply_async(
-            args=[job_id, segment_s3_key, tracked_masks_s3_key],
+            args=[job_id, segment_s3_key, tracked_key],
             queue="inpainting",
         )
 
         return {
             "job_id": job_id,
             "segment_s3_key": segment_s3_key,
-            "tracked_masks_s3_key": tracked_masks_s3_key,
-            "status": "stub",
+            "tracked_masks_s3_key": tracked_key,
+            "status": "real",
+            "num_frames": len(frames),
         }
 
     except SoftTimeLimitExceeded:
@@ -212,6 +247,88 @@ def _extract_frame(video_path: str, frame_index: int) -> np.ndarray:
     if not ret:
         raise RuntimeError(f"could not read frame {frame_index} from {video_path}")
     return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+
+
+
+def _extract_all_frames(video_path: str) -> list[np.ndarray]:
+    """Read up to MAX_TRACKING_FRAMES frames as (H, W, 3) uint8 RGB arrays."""
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    frames: list[np.ndarray] = []
+    while len(frames) < MAX_TRACKING_FRAMES:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    cap.release()
+    return frames
+
+
+def _run_xmem_tracking(
+    frames: list[np.ndarray],
+    mask_binary: np.ndarray,
+    settings: Any,
+    bound_log: Any,
+) -> np.ndarray:
+    """Propagate a first-frame mask across all frames with XMem.
+
+    XMem is loaded directly (not via the model pool): segment_first_frame and
+    track_masks run sequentially, so SAM2 has already released GPU memory before
+    XMem starts, and the pool's VRAM management would only get in the way here.
+    """
+    import sys
+
+    sys.path.insert(0, "/home/kavish/XMem")
+
+    import torch
+    # Clear GPU memory left by SAM2 before loading XMem
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    from model.network import XMem as XMemNetwork
+    from inference.inference_core import InferenceCore
+    from inference.interact.interactive_utils import (
+        image_to_torch,
+        index_numpy_to_one_hot_torch,
+    )
+
+    xmem_config = {
+        "top_k": 30,
+        "mem_every": 5,
+        "deep_update_every": -1,
+        "enable_long_term": True,
+        "enable_long_term_count_usage": True,
+        "num_prototypes": 128,
+        "min_mid_term_frames": 5,
+        "max_mid_term_frames": 10,
+        "max_long_term_elements": 10000,
+    }
+    network = XMemNetwork(
+        xmem_config,
+        os.path.join(settings.model_cache_dir, "XMem.pth"),
+    ).cpu().eval()
+    processor = InferenceCore(network, config=xmem_config)
+    processor.set_all_labels(list(range(1, 2)))  # single object
+    bound_log.info("xmem_model_loaded")
+
+    tracked_masks: list[np.ndarray] = []
+    with torch.no_grad():
+        for i, frame_rgb in enumerate(frames):
+            frame_torch, _ = image_to_torch(frame_rgb, device="cpu")
+            if i == 0:
+                # First frame: seed propagation with the SAM2 mask.
+                mask_torch = index_numpy_to_one_hot_torch(mask_binary, 2)
+                output_prob = processor.step(frame_torch, mask_torch[1:2])
+            else:
+                output_prob = processor.step(frame_torch)
+
+            out_mask = (output_prob[0].cpu().numpy() > 0.5).astype(np.uint8) * 255
+            tracked_masks.append(out_mask)
+
+    bound_log.info("xmem_tracking_complete", num_frames=len(frames))
+    return np.stack(tracked_masks)  # (T, H, W)
 
 
 def _load_sam2_model(settings: Any) -> Any:

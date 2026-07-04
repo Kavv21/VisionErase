@@ -108,6 +108,87 @@ def mock_sam2(monkeypatch):
     return fake_predictor
 
 
+@pytest.fixture()
+def mock_video(monkeypatch):
+    """Patch cv2 so VideoCapture yields a finite frame sequence for track_masks.
+
+    Unlike ``mock_frame`` (single seek), this returns three frames then EOF so
+    the ``while True: cap.read()`` loop in _extract_all_frames terminates.
+    """
+    frame_bgr = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    cap = mock.MagicMock()
+    cap.read.side_effect = [
+        (True, frame_bgr),
+        (True, frame_bgr),
+        (True, frame_bgr),
+        (False, None),
+    ]
+    monkeypatch.setattr("cv2.VideoCapture", mock.MagicMock(return_value=cap))
+    monkeypatch.setattr("cv2.cvtColor", lambda img, code: img)
+    return frame_bgr
+
+
+@pytest.fixture()
+def mock_mask_load(monkeypatch):
+    """Patch np.load so the (mocked, never-downloaded) mask file is not read from disk."""
+    fake_mask = np.full((64, 64), 255, dtype=np.uint8)
+    monkeypatch.setattr(np, "load", lambda path: fake_mask)
+    return fake_mask
+
+
+@pytest.fixture()
+def mock_xmem(monkeypatch):
+    """Inject fake XMem submodules into sys.modules so no real XMem/GPU/weights are needed.
+
+    XMem lives at /home/kavish/XMem and is added to sys.path at call time, not
+    installed as a package. Patching sys.modules mirrors how ``mock_sam2`` keeps
+    the test hermetic without touching the filesystem or a GPU.
+    """
+    fake_network = mock.MagicMock()
+    fake_network.cuda.return_value = fake_network
+    fake_network.eval.return_value = fake_network
+
+    fake_processor = mock.MagicMock()
+    # output_prob[0].cpu().numpy() must be a real ndarray so the > 0.5 /
+    # astype / np.stack chain in _run_xmem_tracking produces genuine masks.
+    out0 = mock.MagicMock()
+    out0.cpu.return_value.numpy.return_value = np.ones((64, 64), dtype=np.float32)
+    output_prob = mock.MagicMock()
+    output_prob.__getitem__.return_value = out0
+    fake_processor.step.return_value = output_prob
+
+    network_module = types.ModuleType("model.network")
+    network_module.XMem = mock.MagicMock(return_value=fake_network)
+    model_pkg = types.ModuleType("model")
+    model_pkg.__path__ = []
+
+    core_module = types.ModuleType("inference.inference_core")
+    core_module.InferenceCore = mock.MagicMock(return_value=fake_processor)
+
+    utils_module = types.ModuleType("inference.interact.interactive_utils")
+    utils_module.image_to_torch = mock.MagicMock(return_value=mock.MagicMock())
+    utils_module.index_numpy_to_one_hot_torch = mock.MagicMock(
+        return_value=mock.MagicMock()
+    )
+
+    inference_pkg = types.ModuleType("inference")
+    inference_pkg.__path__ = []
+    interact_pkg = types.ModuleType("inference.interact")
+    interact_pkg.__path__ = []
+
+    monkeypatch.setitem(sys.modules, "model", model_pkg)
+    monkeypatch.setitem(sys.modules, "model.network", network_module)
+    monkeypatch.setitem(sys.modules, "inference", inference_pkg)
+    monkeypatch.setitem(sys.modules, "inference.inference_core", core_module)
+    monkeypatch.setitem(sys.modules, "inference.interact", interact_pkg)
+    monkeypatch.setitem(
+        sys.modules, "inference.interact.interactive_utils", utils_module
+    )
+
+    return fake_processor
+
+
 VALID_MASK_DATA = {"points": [{"x": 12.0, "y": 34.0}], "frame_index": 0}
 
 
@@ -224,7 +305,7 @@ class TestSegmentFirstFrameEmptyPoints:
         assert pct_values == [0, 50, 100]
 
 
-# ── track_masks (still a stub) ─────────────────────────────────────────────────
+# ── track_masks (real XMem) ────────────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -241,52 +322,69 @@ def test_track_masks_queue(app):
 
 
 @pytest.mark.unit
-def test_track_masks_returns_correct_dict_shape():
-    """Return value must contain exactly the four required keys."""
-    from workers.segmentation.tasks import track_masks
+class TestTrackMasksReal:
+    ARGS = [
+        "job-abc",
+        "jobs/job-abc/segments/seg_0.mp4",
+        "jobs/job-abc/masks/frame_0_mask.npy",
+    ]
 
-    result = track_masks.apply(
-        args=[
-            "job-abc",
-            "jobs/job-abc/segments/seg_0.mp4",
-            "jobs/job-abc/masks/mask_stub.npy",
-        ]
-    ).get()
+    def test_returns_status_real(self, mock_s3, mock_video, mock_mask_load, mock_xmem):
+        from workers.segmentation.tasks import track_masks
 
-    assert isinstance(result, dict)
-    assert set(result.keys()) == {"job_id", "segment_s3_key", "tracked_masks_s3_key", "status"}
+        result = track_masks.apply(args=self.ARGS).get()
+        assert result["status"] == "real"
 
+    def test_returns_correct_dict_shape(
+        self, mock_s3, mock_video, mock_mask_load, mock_xmem
+    ):
+        from workers.segmentation.tasks import track_masks
 
-@pytest.mark.unit
-def test_track_masks_has_tracked_masks_s3_key():
-    """tracked_masks_s3_key must follow the expected stub path pattern."""
-    from workers.segmentation.tasks import track_masks
+        result = track_masks.apply(args=self.ARGS).get()
+        assert set(result.keys()) == {
+            "job_id",
+            "segment_s3_key",
+            "tracked_masks_s3_key",
+            "status",
+            "num_frames",
+        }
 
-    result = track_masks.apply(
-        args=[
-            "job-789",
-            "jobs/job-789/segments/seg_0.mp4",
-            "jobs/job-789/masks/mask_stub.npy",
-        ]
-    ).get()
+    def test_tracked_masks_s3_key_matches_expected_path(
+        self, mock_s3, mock_video, mock_mask_load, mock_xmem
+    ):
+        from workers.segmentation.tasks import track_masks
 
-    assert result["tracked_masks_s3_key"] == "jobs/job-789/masks/tracked_stub.npy"
+        result = track_masks.apply(args=self.ARGS).get()
+        assert result["tracked_masks_s3_key"] == "jobs/job-abc/masks/tracked_masks.npy"
 
+    def test_has_job_id_and_frame_count(
+        self, mock_s3, mock_video, mock_mask_load, mock_xmem
+    ):
+        from workers.segmentation.tasks import track_masks
 
-@pytest.mark.unit
-def test_track_masks_has_job_id():
-    """job_id in the return dict must match the input job_id."""
-    from workers.segmentation.tasks import track_masks
+        result = track_masks.apply(args=self.ARGS).get()
+        assert result["job_id"] == "job-abc"
+        # mock_video yields three frames before EOF
+        assert result["num_frames"] == 3
 
-    result = track_masks.apply(
-        args=[
-            "job-999",
-            "jobs/job-999/segments/seg_0.mp4",
-            "jobs/job-999/masks/mask_stub.npy",
-        ]
-    ).get()
+    def test_downloads_video_and_mask_then_uploads_tracked(
+        self, mock_s3, mock_video, mock_mask_load, mock_xmem
+    ):
+        from workers.segmentation.tasks import track_masks
 
-    assert result["job_id"] == "job-999"
+        track_masks.apply(args=self.ARGS).get()
+        # both the segment and the SAM2 mask are pulled from MinIO
+        assert mock_s3.download_file.call_count == 2
+        assert mock_s3.upload_file.called
+
+    def test_publishes_progress_at_0_50_100(
+        self, mock_s3, mock_video, mock_mask_load, mock_xmem, mock_redis
+    ):
+        from workers.segmentation.tasks import track_masks
+
+        track_masks.apply(args=self.ARGS).get()
+        pct_values = [d["pct"] for d in mock_redis if d.get("stage") == "tracking"]
+        assert pct_values == [0, 50, 100]
 
 
 # ── Auth regression: job creation (which enqueues segment_first_frame) ────────

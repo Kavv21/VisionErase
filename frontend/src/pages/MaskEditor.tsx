@@ -153,8 +153,8 @@ export default function MaskEditor() {
       ctx.lineTo(points[i].x, points[i].y)
     }
     ctx.closePath()
-    ctx.fillStyle = 'rgba(220, 38, 38, 0.35)'
-    ctx.strokeStyle = 'rgba(220, 38, 38, 0.85)'
+    ctx.fillStyle = 'rgba(124, 58, 237, 0.35)'
+    ctx.strokeStyle = 'rgba(124, 58, 237, 0.85)'
     ctx.lineWidth = 2
     ctx.fill()
     ctx.stroke()
@@ -210,7 +210,7 @@ export default function MaskEditor() {
       } else {
         ctx.beginPath()
         ctx.arc(x, y, BRUSH_RADIUS, 0, Math.PI * 2)
-        ctx.fillStyle = 'rgba(220, 38, 38, 0.5)'
+        ctx.fillStyle = 'rgba(124, 58, 237, 0.5)'
         ctx.fill()
         // Track the point in video coordinates for submit
         const videoPoint = canvasToVideoCoords(clientX, clientY, maskCanvas, videoSize.w, videoSize.h)
@@ -270,159 +270,131 @@ export default function MaskEditor() {
 
   if (!isAuthenticated || !file || !s3Key) return null
 
+  const toolButtonClass = (active: boolean) =>
+    `w-10 h-10 flex items-center justify-center rounded-xl transition-colors duration-200 ${
+      active ? 'bg-[#7C3AED] text-white' : 'text-[#A0A0B0] hover:text-white hover:bg-white/5'
+    }`
+
   return (
-    <div className="min-h-screen bg-[#FAFAF8] py-10 px-4">
-      <div className="max-w-5xl mx-auto">
-        <p className="text-sm font-semibold text-red-600 mb-4">• Mark what to remove</p>
-        <h1 className="text-4xl font-black text-stone-900 tracking-tight mb-2">Mask Editor</h1>
-        <p className="text-stone-500 mb-6 text-sm">
-          Click, brush, or paint over the object you want erased. Then submit.
-        </p>
+    <div className="h-screen flex flex-col bg-[#0A0A0F] overflow-hidden">
+      {/* Top bar */}
+      <div className="h-12 shrink-0 flex items-center justify-between px-4 border-b border-white/10 backdrop-blur-xl bg-white/[0.02]">
+        <span className="text-xs text-[#A0A0B0] font-mono truncate max-w-[200px]">{file.name}</span>
+        <span className="text-sm font-black bg-gradient-to-r from-[#A78BFA] to-[#60A5FA] bg-clip-text text-transparent">
+          VisionErase
+        </span>
+        <svg className="w-5 h-5 text-[#A0A0B0]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg>
+      </div>
 
-        {showStubBadge && (
-          <div className="mb-4 inline-flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700 font-medium">
-            <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+      <div className="flex-1 flex min-h-0">
+        {/* Left tool panel */}
+        <div className="w-[60px] shrink-0 flex flex-col items-center gap-2 py-4 border-r border-white/10 backdrop-blur-xl bg-white/[0.02]">
+          <button onClick={() => setTool('point')} className={toolButtonClass(tool === 'point')} title="Point Click">
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5" />
             </svg>
-            Preview mode — full AI segmentation coming soon
-          </div>
-        )}
+          </button>
+          <button onClick={() => setTool('brush')} className={toolButtonClass(tool === 'brush')} title="Brush">
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+            </svg>
+          </button>
+          <button onClick={() => setTool('eraser')} className={toolButtonClass(tool === 'eraser')} title="Eraser">
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+          </button>
+          <div className="w-6 h-px bg-white/10 my-1" />
+          <button onClick={handleClearAll} className={toolButtonClass(false)} title="Clear All">
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3" />
+            </svg>
+          </button>
+        </div>
 
-        <div className="flex gap-4 items-start">
-          {/* Canvas + scrubber column */}
-          <div className="flex-1 flex flex-col gap-3">
-            <div className="bg-stone-900 rounded-2xl overflow-hidden relative">
+        {/* Center canvas area */}
+        <div className="flex-1 flex flex-col min-w-0">
+          <div className="flex-1 flex items-center justify-center p-6 relative overflow-auto">
+            {showStubBadge && (
+              <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 inline-flex items-center gap-2 px-3 py-1.5 backdrop-blur-xl bg-amber-500/10 border border-amber-500/30 rounded-full text-xs text-amber-400 font-medium">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                Preview mode — full AI segmentation coming soon
+              </div>
+            )}
+
+            <div
+              className="relative rounded-lg overflow-hidden"
+              style={{ boxShadow: '0 0 40px rgba(124,58,237,0.2)', lineHeight: 0 }}
+            >
               {!frameReady && (
-                <div className="absolute inset-0 flex items-center justify-center text-stone-400 text-sm">
+                <div className="w-[480px] h-[270px] flex items-center justify-center text-[#A0A0B0] text-sm bg-[#12121A]">
                   Loading first frame…
                 </div>
               )}
-              <div className="relative" style={{ lineHeight: 0 }}>
-                {/* Frame canvas */}
-                <canvas
-                  ref={frameCanvasRef}
-                  className="w-full block"
-                  style={{ display: frameReady ? 'block' : 'none' }}
-                />
-                {/* Mask overlay canvas — exactly stacked on top */}
-                <canvas
-                  ref={maskCanvasRef}
-                  className="w-full block absolute inset-0"
-                  style={{
-                    display: frameReady ? 'block' : 'none',
-                    cursor: tool === 'point' ? 'crosshair' : tool === 'eraser' ? 'cell' : 'default',
-                  }}
-                  onPointerDown={handlePointerDown}
-                  onPointerMove={handlePointerMove}
-                  onPointerUp={handlePointerUp}
-                  onPointerLeave={handlePointerUp}
-                />
-                {/* Loading dot at click position for point tool */}
-                {previewLoading && previewClickPos && (
-                  <div
-                    className="absolute w-5 h-5 rounded-full border-2 border-red-400 border-t-transparent animate-spin"
-                    style={{
-                      left: previewClickPos.x - 10,
-                      top: previewClickPos.y - 10,
-                      pointerEvents: 'none',
-                    }}
-                  />
-                )}
-              </div>
-            </div>
-
-            {/* Frame scrubber */}
-            <div className="bg-white rounded-2xl shadow-sm border border-stone-100 p-4">
-              <input
-                type="range"
-                min={0}
-                max={Math.max(totalFrames - 1, 0)}
-                value={currentFrame}
-                disabled={!frameReady || totalFrames <= 1}
-                onChange={(e) => handleScrub(Number(e.target.value))}
-                className="w-full accent-red-600 disabled:opacity-50"
+              {/* Frame canvas */}
+              <canvas
+                ref={frameCanvasRef}
+                className="block max-w-full max-h-[calc(100vh-220px)]"
+                style={{ display: frameReady ? 'block' : 'none' }}
               />
-              <p className="text-xs text-stone-500 text-center mt-2 font-medium">
-                Frame {currentFrame} / {totalFrames}
-              </p>
+              {/* Mask overlay canvas — exactly stacked on top */}
+              <canvas
+                ref={maskCanvasRef}
+                className="block absolute inset-0 max-w-full max-h-[calc(100vh-220px)] w-full h-full"
+                style={{
+                  display: frameReady ? 'block' : 'none',
+                  cursor: tool === 'point' ? 'crosshair' : tool === 'eraser' ? 'cell' : 'default',
+                }}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={handlePointerUp}
+                onPointerLeave={handlePointerUp}
+              />
+              {/* Loading dot at click position for point tool */}
+              {previewLoading && previewClickPos && (
+                <div
+                  className="absolute w-5 h-5 rounded-full border-2 border-[#A78BFA] border-t-transparent animate-spin"
+                  style={{
+                    left: previewClickPos.x - 10,
+                    top: previewClickPos.y - 10,
+                    pointerEvents: 'none',
+                  }}
+                />
+              )}
             </div>
           </div>
 
-          {/* Toolbar */}
-          <div className="w-48 flex-shrink-0 bg-white rounded-2xl shadow-sm border border-stone-100 p-4 flex flex-col gap-3">
-            <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide">Tools</p>
-
-            <button
-              onClick={() => setTool('point')}
-              className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition-colors ${
-                tool === 'point'
-                  ? 'bg-red-600 text-white'
-                  : 'text-stone-600 hover:bg-stone-50'
-              }`}
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5" />
-              </svg>
-              Point Click
-            </button>
-
-            <button
-              onClick={() => setTool('brush')}
-              className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition-colors ${
-                tool === 'brush'
-                  ? 'bg-red-600 text-white'
-                  : 'text-stone-600 hover:bg-stone-50'
-              }`}
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
-              </svg>
-              Brush
-            </button>
-
-            <button
-              onClick={() => setTool('eraser')}
-              className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition-colors ${
-                tool === 'eraser'
-                  ? 'bg-red-600 text-white'
-                  : 'text-stone-600 hover:bg-stone-50'
-              }`}
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-              </svg>
-              Eraser
-            </button>
-
-            <div className="border-t border-stone-100 my-1" />
-
-            <button
-              onClick={handleClearAll}
-              className="flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold text-stone-500 hover:bg-stone-50 transition-colors"
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-              Clear All
-            </button>
-
-            <div className="border-t border-stone-100 my-1" />
-
+          {/* Bottom panel: scrubber + controls */}
+          <div className="shrink-0 border-t border-white/10 backdrop-blur-xl bg-white/[0.02] px-6 py-3 flex items-center gap-4">
+            <input
+              type="range"
+              min={0}
+              max={Math.max(totalFrames - 1, 0)}
+              value={currentFrame}
+              disabled={!frameReady || totalFrames <= 1}
+              onChange={(e) => handleScrub(Number(e.target.value))}
+              className="flex-1 accent-purple disabled:opacity-50"
+              style={{ accentColor: '#7C3AED' }}
+            />
+            <span className="text-xs font-mono text-[#A0A0B0] shrink-0">
+              Frame {currentFrame} / {totalFrames}
+            </span>
+            <span className="text-xs text-[#A0A0B0] shrink-0">
+              {maskPoints.length} point{maskPoints.length !== 1 ? 's' : ''} marked
+            </span>
             {submitError && (
-              <p className="text-xs text-red-600 bg-red-50 rounded-lg px-2 py-1.5">{submitError}</p>
+              <span className="text-xs text-[#EF4444] shrink-0">{submitError}</span>
             )}
-
             <button
               onClick={handleSubmit}
               disabled={submitting || !frameReady}
-              className="w-full py-2.5 bg-red-600 text-white font-semibold rounded-xl text-sm hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="shrink-0 px-5 py-2 bg-gradient-to-r from-[#7C3AED] to-[#2563EB] text-white font-semibold rounded-xl text-sm shadow-[0_0_16px_rgba(124,58,237,0.35)] hover:shadow-[0_0_24px_rgba(124,58,237,0.55)] transition-shadow duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-none"
             >
-              {submitting ? 'Submitting…' : 'Submit'}
+              {submitting ? 'Submitting…' : 'Start Removal →'}
             </button>
-
-            <p className="text-xs text-stone-400 text-center">
-              {maskPoints.length} point{maskPoints.length !== 1 ? 's' : ''} marked
-            </p>
           </div>
         </div>
       </div>

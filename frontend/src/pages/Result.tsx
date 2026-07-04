@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import { motion } from 'framer-motion'
 import { useAuthStore } from '../store/authStore'
 import { useUploadStore } from '../store/uploadStore'
 import { apiGetJobDownload } from '../api/jobs'
+import GlassCard from '../components/GlassCard'
+import GlowButton from '../components/GlowButton'
 
 type QualityStatus = 'clean' | 'soft' | 'boundary' | 'flagged'
 
@@ -12,10 +15,10 @@ interface QualitySegment {
 }
 
 const QUALITY_COLORS: Record<QualityStatus, string> = {
-  clean: 'bg-green-500',
+  clean: 'bg-[#10B981]',
   soft: 'bg-yellow-400',
   boundary: 'bg-orange-400',
-  flagged: 'bg-red-500',
+  flagged: 'bg-[#EF4444]',
 }
 
 function QualityTimeline({ segments }: { segments?: QualitySegment[] }) {
@@ -28,16 +31,16 @@ function QualityTimeline({ segments }: { segments?: QualitySegment[] }) {
           ))}
         </div>
       ) : (
-        <div className="relative h-3 w-full overflow-hidden rounded-full bg-stone-100">
-          <div className="absolute inset-0 rounded-full bg-green-500" />
+        <div className="relative h-3 w-full overflow-hidden rounded-full bg-white/5">
+          <div className="absolute inset-0 rounded-full bg-[#10B981] shadow-[0_0_12px_rgba(16,185,129,0.5)]" />
         </div>
       )}
-      <p className="mt-2 text-xs font-semibold text-stone-500">
-        {segments && segments.length > 0 ? 'Per-chunk quality' : 'Processing complete'}
+      <p className="mt-2 text-xs font-semibold text-[#10B981]">
+        {segments && segments.length > 0 ? 'Per-chunk quality' : 'Processing Complete'}
       </p>
-      <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-stone-500">
+      <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-[#A0A0B0]">
         <span className="flex items-center gap-1.5">
-          <span className="h-2 w-2 rounded-full bg-green-500" /> Clean
+          <span className="h-2 w-2 rounded-full bg-[#10B981]" /> Clean
         </span>
         <span className="flex items-center gap-1.5">
           <span className="h-2 w-2 rounded-full bg-yellow-400" /> Soft
@@ -46,7 +49,7 @@ function QualityTimeline({ segments }: { segments?: QualitySegment[] }) {
           <span className="h-2 w-2 rounded-full bg-orange-400" /> Boundary
         </span>
         <span className="flex items-center gap-1.5">
-          <span className="h-2 w-2 rounded-full bg-red-500" /> Flagged
+          <span className="h-2 w-2 rounded-full bg-[#EF4444]" /> Flagged
         </span>
       </div>
     </div>
@@ -190,37 +193,43 @@ export default function Result() {
   }
 
   return (
-    <div className="min-h-screen bg-[#FAFAF8] py-16 px-4">
+    <div className="min-h-screen bg-[#0A0A0F] py-16 px-4">
       <div className="max-w-4xl mx-auto">
-        <p className="text-sm font-semibold text-red-600 mb-4">• Result</p>
-        <h1 className="text-5xl font-black text-stone-900 tracking-tight mb-2">
-          Your video is ready
-        </h1>
-        <p className="text-stone-400 text-xs font-mono mb-10">{jobId}</p>
+        <div className="relative mb-2">
+          <div className="absolute -inset-x-10 -inset-y-6 bg-[#10B981]/10 blur-3xl rounded-full pointer-events-none" />
+          <h1 className="relative text-5xl font-black tracking-tight bg-gradient-to-r from-[#A78BFA] to-[#60A5FA] bg-clip-text text-transparent">
+            Your Video is Ready
+          </h1>
+        </div>
+        <p className="text-[#A0A0B0] text-xs font-mono mb-10">{jobId}</p>
 
         {noResult ? (
-          <div className="bg-white rounded-2xl p-8 shadow-sm border border-stone-100 text-center">
-            <h2 className="text-xl font-black text-stone-900 mb-2">No output was generated</h2>
-            <p className="text-stone-500 text-sm mb-6">
+          <GlassCard className="p-8 text-center border-dashed border-[#7C3AED]/40">
+            <motion.div
+              animate={{ opacity: [0.5, 1, 0.5] }}
+              transition={{ duration: 2, repeat: Infinity }}
+              className="w-14 h-14 rounded-full bg-white/5 flex items-center justify-center mx-auto mb-4"
+            >
+              <svg className="w-6 h-6 text-[#A78BFA]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+              </svg>
+            </motion.div>
+            <h2 className="text-xl font-black text-[#F8F8FF] mb-2">No output was generated</h2>
+            <p className="text-[#A0A0B0] text-sm mb-6">
               Processing completed but no output was generated. Please try again.
             </p>
-            <button
-              onClick={handleProcessAnother}
-              className="px-5 py-2.5 bg-red-600 text-white font-semibold rounded-xl hover:bg-red-700 transition-colors"
-            >
-              Try again
-            </button>
-          </div>
+            <GlowButton onClick={handleProcessAnother}>Try again</GlowButton>
+          </GlassCard>
         ) : (
           <>
             {/* Video comparison */}
-            <div className="bg-white rounded-2xl p-6 shadow-sm border border-stone-100 mb-6">
+            <GlassCard className="p-6 mb-6">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <p className="text-xs font-bold uppercase tracking-wide text-stone-400 mb-2">
+                  <span className="inline-block px-3 py-1 rounded-full bg-white/10 text-xs font-semibold text-[#A0A0B0] mb-2">
                     Original
-                  </p>
-                  <div className="relative rounded-xl overflow-hidden bg-stone-900 aspect-video">
+                  </span>
+                  <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
                     {originalUrl ? (
                       <video
                         ref={originalRef}
@@ -233,7 +242,7 @@ export default function Result() {
                         onPause={() => setIsPlaying(false)}
                       />
                     ) : (
-                      <div className="flex items-center justify-center h-full text-stone-400 text-xs px-4 text-center">
+                      <div className="flex items-center justify-center h-full text-[#A0A0B0] text-xs px-4 text-center">
                         Original video unavailable (page was reloaded)
                       </div>
                     )}
@@ -241,12 +250,15 @@ export default function Result() {
                 </div>
 
                 <div>
-                  <p className="text-xs font-bold uppercase tracking-wide text-stone-400 mb-2">
+                  <span className="inline-block px-3 py-1 rounded-full bg-[#7C3AED]/20 text-xs font-semibold text-[#A78BFA] mb-2">
                     Processed
-                  </p>
-                  <div className="relative rounded-xl overflow-hidden bg-stone-900 aspect-video flex items-center justify-center">
+                  </span>
+                  <div
+                    className="relative rounded-xl overflow-hidden bg-black aspect-video flex items-center justify-center"
+                    style={{ boxShadow: '0 0 32px rgba(124,58,237,0.25)' }}
+                  >
                     {downloadLoading && (
-                      <div className="w-8 h-8 border-2 border-stone-600 border-t-white rounded-full animate-spin" />
+                      <div className="w-8 h-8 border-2 border-white/20 border-t-[#A78BFA] rounded-full animate-spin" />
                     )}
                     {!downloadLoading && downloadError && (
                       <p className="text-red-300 text-xs px-4 text-center">{downloadError}</p>
@@ -268,7 +280,7 @@ export default function Result() {
                 <button
                   onClick={togglePlayPause}
                   disabled={!originalUrl}
-                  className="w-10 h-10 flex items-center justify-center rounded-full bg-red-600 text-white hover:bg-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                  className="w-10 h-10 flex items-center justify-center rounded-full bg-gradient-to-br from-[#7C3AED] to-[#2563EB] text-white shadow-[0_0_16px_rgba(124,58,237,0.4)] hover:shadow-[0_0_24px_rgba(124,58,237,0.6)] transition-shadow duration-200 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:shadow-none shrink-0"
                 >
                   {isPlaying ? (
                     <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
@@ -281,7 +293,7 @@ export default function Result() {
                     </svg>
                   )}
                 </button>
-                <span className="text-xs font-mono text-stone-400 w-10">
+                <span className="text-xs font-mono text-[#A0A0B0] w-10">
                   {formatTime(currentTime)}
                 </span>
                 <input
@@ -292,40 +304,44 @@ export default function Result() {
                   value={currentTime}
                   onChange={handleSeek}
                   disabled={!originalUrl || !duration}
-                  className="flex-1 accent-red-600 disabled:opacity-40"
+                  className="flex-1 disabled:opacity-40"
+                  style={{ accentColor: '#7C3AED' }}
                 />
-                <span className="text-xs font-mono text-stone-400 w-10">
+                <span className="text-xs font-mono text-[#A0A0B0] w-10">
                   {formatTime(duration)}
                 </span>
               </div>
-            </div>
+            </GlassCard>
 
             {/* Quality timeline */}
-            <div className="bg-white rounded-2xl p-6 shadow-sm border border-stone-100 mb-6">
-              <p className="text-xs font-bold uppercase tracking-wide text-stone-400 mb-3">
+            <GlassCard className="p-6 mb-6">
+              <p className="text-xs font-bold uppercase tracking-wide text-[#A0A0B0] mb-3">
                 Quality timeline
               </p>
               <QualityTimeline />
-            </div>
+            </GlassCard>
 
             {/* Actions */}
             <div className="flex flex-wrap items-center gap-3">
-              <button
+              <GlowButton
                 onClick={handleDownload}
                 disabled={downloadLoading || !!noResult}
-                className="px-5 py-2.5 bg-red-600 text-white font-semibold rounded-xl hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="inline-flex items-center gap-2"
               >
-                Download
-              </button>
-              <button
-                onClick={handleProcessAnother}
-                className="px-5 py-2.5 border border-stone-300 rounded-xl text-sm font-semibold text-stone-600 hover:bg-white transition-colors"
-              >
-                Process another video
-              </button>
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3" />
+                </svg>
+                Download Video
+              </GlowButton>
+              <GlowButton variant="outline" onClick={() => navigate('/editor')}>
+                Edit Mask
+              </GlowButton>
+              <GlowButton variant="ghost" onClick={handleProcessAnother}>
+                Process Another
+              </GlowButton>
               <button
                 onClick={() => navigate('/')}
-                className="text-sm font-semibold text-stone-500 hover:text-stone-800 transition-colors underline"
+                className="text-sm font-semibold text-[#A0A0B0] hover:text-white transition-colors underline"
               >
                 Back to dashboard
               </button>

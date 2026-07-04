@@ -1,7 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import { motion } from 'framer-motion'
 import { useAuthStore } from '../store/authStore'
 import { apiGetJob } from '../api/jobs'
+import ProgressRing from '../components/ProgressRing'
+import StageCard, { type StageStatus } from '../components/StageCard'
+import GlassCard from '../components/GlassCard'
 
 // Message shapes the /ws/{job_id} endpoint actually emits (see api/routers/websocket.py)
 type WsMsg =
@@ -22,7 +26,88 @@ const STAGE_LABELS: Record<string, string> = {
   failed: 'Failed',
 }
 
+// Backend stage progression, used only to derive which display stage is active/complete.
+const BACKEND_ORDER = ['pending', 'segmenting', 'tracking', 'inpainting', 'stitching', 'quality_check', 'completed']
+
+const PIPELINE_STAGES: { title: string; backendIdx: number; icon: ReactElement }[] = [
+  {
+    title: 'Uploading Video',
+    backendIdx: 0,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+      </svg>
+    ),
+  },
+  {
+    title: 'SAM2 Object Mask Generated',
+    backendIdx: 1,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5" />
+      </svg>
+    ),
+  },
+  {
+    title: 'XMem++ Tracking Mask Across Frames',
+    backendIdx: 2,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
+      </svg>
+    ),
+  },
+  {
+    title: 'OIV Embedding — Verifying Object Identity',
+    backendIdx: 2,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+    ),
+  },
+  {
+    title: 'Boundary Fusion — Cleaning Edges',
+    backendIdx: 4,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+      </svg>
+    ),
+  },
+  {
+    title: 'ProPainter — Filling Removed Region',
+    backendIdx: 3,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+      </svg>
+    ),
+  },
+  {
+    title: 'Rendering Final Video',
+    backendIdx: 5,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+      </svg>
+    ),
+  },
+]
+
+function stageStatus(uiIdx: number, backendIdx: number, currentIdx: number, wsError: boolean): StageStatus {
+  if (uiIdx === 0) return 'complete'
+  if (currentIdx > backendIdx) return 'complete'
+  if (currentIdx === backendIdx) return wsError ? 'failed' : 'active'
+  return 'pending'
+}
+
 type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'failed'
+
+interface LogLine {
+  time: string
+  message: string
+}
 
 export default function JobProgress() {
   const { jobId } = useParams<{ jobId: string }>()
@@ -155,107 +240,115 @@ export default function JobProgress() {
     }
   }, [isDone, wsError, jobId, navigate])
 
+  // Purely visual: append a timestamped line to the processing log whenever
+  // the displayed stage changes. Does not affect WS/polling behavior.
+  const [log, setLog] = useState<LogLine[]>([])
+  const lastLoggedStage = useRef<string | null>(null)
+  useEffect(() => {
+    if (lastLoggedStage.current === stage) return
+    lastLoggedStage.current = stage
+    const time = new Date().toLocaleTimeString([], { hour12: false })
+    const label = STAGE_LABELS[stage] ?? stage
+    setLog((prev) => [...prev, { time, message: label }])
+  }, [stage])
+  const logEndRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [log])
+
   if (!isAuthenticated) return null
 
-  const stageLabel = STAGE_LABELS[stage] ?? stage
+  const currentIdx = stage === 'completed' ? BACKEND_ORDER.length - 1 : BACKEND_ORDER.indexOf(stage)
 
   return (
-    <div className="min-h-screen bg-[#FAFAF8] py-16 px-4">
+    <div className="min-h-screen bg-[#0A0A0F] py-16 px-4">
       <div className="max-w-2xl mx-auto">
-        <p className="text-sm font-semibold text-red-600 mb-4">• Processing</p>
-        <h1 className="text-4xl font-black text-stone-900 tracking-tight mb-2">Job Progress</h1>
-        <p className="text-stone-400 text-xs font-mono mb-8">{jobId}</p>
+        <h1 className="text-4xl md:text-5xl font-black tracking-tight mb-2 bg-gradient-to-r from-[#A78BFA] to-[#60A5FA] bg-clip-text text-transparent">
+          Processing Your Video
+        </h1>
+        <p className="text-[#A0A0B0] text-xs font-mono mb-10 select-all">{jobId}</p>
 
-        <div className="bg-white rounded-2xl p-8 shadow-sm border border-stone-100">
-          {/* Connection state */}
-          {connState === 'connecting' && (
-            <div className="flex items-center gap-2 text-stone-500 text-sm mb-6">
-              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              Connecting…
-            </div>
-          )}
-          {connState === 'reconnecting' && (
-            <div className="flex items-center gap-2 text-stone-500 text-sm mb-6">
-              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              Reconnecting…
-            </div>
-          )}
-          {connState === 'failed' && !isDone && (
-            <div className="mb-6 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-700">
-              <p className="font-semibold mb-1">Connection lost</p>
-              <p className="mb-3 text-xs">
-                The server is not sending updates right now. This is expected while workers are
-                starting up. The job is still queued and will process when a worker is available.
-              </p>
-              <button
-                onClick={() => {
-                  reconnectAttemptedRef.current = false
-                  setConnState('connecting')
-                  const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? 'http://localhost:8000'
-                  const wsBase = apiBase.replace(/^http/, 'ws')
-                  const ws = new WebSocket(`${wsBase}/ws/${jobId}`)
-                  wsRef.current = ws
-                  window.location.reload()
-                }}
-                className="text-xs font-semibold underline"
-              >
-                Refresh page
-              </button>
-            </div>
-          )}
-
-          {/* Stage + progress bar */}
-          <div className="mb-6">
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-2">
-                {!isDone && connState === 'open' && (
-                  <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-                )}
-                {isDone && !wsError && (
-                  <span className="w-2 h-2 rounded-full bg-green-400" />
-                )}
-                {wsError && (
-                  <span className="w-2 h-2 rounded-full bg-red-400" />
-                )}
-                <span className="font-semibold text-stone-800 text-sm">{stageLabel}</span>
-              </div>
-              <span className="text-sm text-stone-500 font-mono">{Math.round(pct)}%</span>
-            </div>
-            <div className="h-2.5 bg-stone-100 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-red-500 rounded-full transition-all duration-500"
-                style={{ width: `${pct}%` }}
-              />
-            </div>
-          </div>
-
-          {/* Error from WS */}
-          {wsError && (
-            <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-sm text-red-700">
-              <p className="font-semibold mb-1">Job failed</p>
-              <p>{wsError}</p>
-            </div>
-          )}
-
-          {/* Success */}
-          {isDone && !wsError && (
-            <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-3 text-sm text-green-700">
-              <p className="font-semibold mb-1">Processing complete</p>
-              {resultKey ? (
-                <p className="text-xs font-mono">{resultKey}</p>
-              ) : (
-                <p className="text-xs">Your video is ready.</p>
-              )}
-            </div>
-          )}
-
-          {/* Pending/waiting explanation */}
-          {!isDone && !wsError && stage === 'pending' && connState !== 'failed' && (
-            <p className="text-xs text-stone-400 mt-4">
-              Your job is queued. Progress will update automatically when a worker picks it up.
+        {/* Waiting to start */}
+        {stage === 'pending' && !wsError && connState !== 'failed' ? (
+          <GlassCard className="p-10 flex flex-col items-center text-center mb-8">
+            <motion.div
+              animate={{ scale: [1, 1.15, 1], opacity: [0.6, 1, 0.6] }}
+              transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
+              className="w-16 h-16 rounded-full bg-[#7C3AED] shadow-[0_0_40px_rgba(124,58,237,0.6)] mb-5"
+            />
+            <p className="text-[#F8F8FF] font-semibold mb-1">Your job is queued...</p>
+            <p className="text-xs text-[#A0A0B0]">
+              Progress will update automatically when a worker picks it up.
             </p>
-          )}
+          </GlassCard>
+        ) : (
+          <div className="flex justify-center mb-8">
+            <ProgressRing percent={pct} />
+          </div>
+        )}
+
+        {(connState === 'connecting' || connState === 'reconnecting') && (
+          <div className="flex items-center justify-center gap-2 text-[#A0A0B0] text-sm mb-6">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+            {connState === 'connecting' ? 'Connecting…' : 'Reconnecting…'}
+          </div>
+        )}
+        {connState === 'failed' && !isDone && (
+          <GlassCard className="mb-6 px-4 py-3 text-sm text-amber-400 border-amber-500/30">
+            <p className="font-semibold mb-1">Connection lost</p>
+            <p className="mb-3 text-xs text-[#A0A0B0]">
+              The server is not sending updates right now. This is expected while workers are
+              starting up. The job is still queued and will process when a worker is available.
+            </p>
+            <button
+              onClick={() => window.location.reload()}
+              className="text-xs font-semibold underline"
+            >
+              Refresh page
+            </button>
+          </GlassCard>
+        )}
+
+        {wsError && (
+          <GlassCard className="mb-6 px-4 py-3 text-sm text-[#EF4444] border-[#EF4444]/30">
+            <p className="font-semibold mb-1">Job failed</p>
+            <p>{wsError}</p>
+          </GlassCard>
+        )}
+
+        {isDone && !wsError && (
+          <GlassCard className="mb-6 px-4 py-3 text-sm text-[#10B981] border-[#10B981]/30">
+            <p className="font-semibold mb-1">Processing complete</p>
+            {resultKey ? <p className="text-xs font-mono">{resultKey}</p> : <p className="text-xs">Your video is ready.</p>}
+          </GlassCard>
+        )}
+
+        {/* Pipeline stages */}
+        <div className="space-y-3 mb-8">
+          {PIPELINE_STAGES.map((s, i) => (
+            <StageCard
+              key={s.title}
+              index={i}
+              title={s.title}
+              icon={s.icon}
+              status={stageStatus(i, s.backendIdx, currentIdx, !!wsError)}
+            />
+          ))}
         </div>
+
+        {/* Processing log */}
+        <GlassCard className="p-4">
+          <p className="text-xs font-semibold text-[#A0A0B0] uppercase tracking-wide mb-2">Processing log</p>
+          <div className="h-40 overflow-y-auto font-mono text-xs space-y-1.5 pr-1">
+            {log.map((line, i) => (
+              <div key={i}>
+                <span className="text-[#A78BFA]">[{line.time}]</span>{' '}
+                <span className="text-[#F8F8FF]">{line.message}</span>
+              </div>
+            ))}
+            <div ref={logEndRef} />
+          </div>
+        </GlassCard>
       </div>
     </div>
   )
