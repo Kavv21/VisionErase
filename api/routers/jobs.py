@@ -108,9 +108,9 @@ async def create_job(
     await enqueue_job(redis, job_id, queue_score, payload)
     # Dispatch to Celery segmentation worker
     segment_first_frame.apply_async(
-    args=[job_id, req.video_s3_key, mask_dict],
-    queue="segmentation",
-    priority=int(req.priority),
+        args=[job_id, req.video_s3_key, mask_dict],
+        queue="segmentation",
+        priority=int(req.priority),
     )
     bound_log.info("job_accepted", priority=req.priority.name)
     JOB_SUBMISSIONS_TOTAL.labels(outcome="accepted").inc()

@@ -46,6 +46,12 @@ celery_app.autodiscover_tasks([
     "workers.quality",
     "workers.boundary",
 ])
+# Full-video chunking tasks live in chunk_tasks.py alongside each stage's
+# tasks.py — a second autodiscover pass with related_name picks them up.
+celery_app.autodiscover_tasks(
+    ["workers.segmentation", "workers.inpainting"],
+    related_name="chunk_tasks",
+)
 
 # ── Worker startup signal ──────────────────────────────────────────────────────
 

@@ -9,6 +9,7 @@ import sys
 import types
 from unittest import mock
 
+import cv2
 import numpy as np
 import pytest
 from fastapi import HTTPException, status
@@ -28,7 +29,7 @@ def mock_redis(monkeypatch):
     async def noop_publish(job_id: str, data: dict) -> None:
         published.append(data)
 
-    async def noop_status(job_id: str, status_: str, error: str) -> None:
+    async def noop_status(job_id: str, status_: str, error: str = None, extra: dict = None) -> None:
         pass
 
     monkeypatch.setattr("workers.segmentation.tasks._publish", noop_publish)
@@ -61,11 +62,19 @@ def mock_s3(monkeypatch):
 
 @pytest.fixture()
 def mock_frame(monkeypatch):
-    """Patch cv2 so VideoCapture returns a fixed fake frame instead of reading a real video."""
+    """Patch cv2 so VideoCapture returns a fixed fake frame instead of reading a real video.
+
+    Also mocks cap.get() for CAP_PROP_FRAME_COUNT/CAP_PROP_FPS: segment_first_frame
+    reads these to compute chunk boundaries for the (default-enabled) chunking path.
+    """
     frame_bgr = np.zeros((64, 64, 3), dtype=np.uint8)
 
     cap = mock.MagicMock()
     cap.read.return_value = (True, frame_bgr)
+    cap.get.side_effect = lambda prop: {
+        cv2.CAP_PROP_FRAME_COUNT: 150,
+        cv2.CAP_PROP_FPS: 30.0,
+    }.get(prop, 0)
     monkeypatch.setattr("cv2.VideoCapture", mock.MagicMock(return_value=cap))
     monkeypatch.setattr("cv2.cvtColor", lambda img, code: img)
     return frame_bgr
@@ -233,8 +242,19 @@ class TestSegmentFirstFrameReal:
             "job_id",
             "segment_s3_key",
             "mask_s3_key",
+            "total_chunks",
             "status",
         }
+
+    def test_total_chunks_matches_frame_count(self, mock_s3, mock_frame, mock_sam2):
+        """150 frames / CHUNK_SIZE=60 → 3 chunks (60, 60, 30)."""
+        from workers.segmentation.tasks import segment_first_frame
+
+        result = segment_first_frame.apply(
+            args=["job-real", "jobs/job-real/segments/seg_0.mp4", VALID_MASK_DATA]
+        ).get()
+
+        assert result["total_chunks"] == 3
 
     def test_mask_s3_key_matches_expected_path(self, mock_s3, mock_frame, mock_sam2):
         from workers.segmentation.tasks import segment_first_frame

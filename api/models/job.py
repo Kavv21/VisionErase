@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class MaskPoint(BaseModel):
     x: float
     y: float
+    label: int = 1  # 1 = positive (include), -1 = negative (exclude) — used by SAM2 preview
 
 
 class MaskData(BaseModel):
@@ -68,13 +69,16 @@ class JobResponse(BaseModel):
 
 class SegmentPreviewRequest(BaseModel):
     video_s3_key: str
-    point: MaskPoint
+    points: list[MaskPoint]
     frame_index: int = 0
 
 
 class SegmentPreviewResponse(BaseModel):
-    mask_points: list[MaskPoint]
-    stub: bool = True
+    mask_base64: str  # base64-encoded single-channel PNG, 0/255
+    score: float
+    width: int
+    height: int
+    stub: bool = False
 
 
 class UploadURLRequest(BaseModel):

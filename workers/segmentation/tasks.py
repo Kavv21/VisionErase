@@ -16,9 +16,11 @@ from api.models.job import JobStatus
 
 log = structlog.get_logger(__name__)
 
-MAX_TRACKING_FRAMES = 30    # cap to avoid timeout on CPU
+MAX_TRACKING_FRAMES = 60    # process 60 frames per chunk to avoid RAM OOM
 TRACKING_WIDTH      = 854   # resize to 480p
 TRACKING_HEIGHT     = 480
+
+CHUNK_SIZE = 60  # frames per chunk when splitting a full video for chunked tracking
 
 
 # Import celery_app lazily to avoid circular imports at module load time.
@@ -87,10 +89,54 @@ def segment_first_frame(
             np.save(mask_path, mask_array)
             s3.upload_file(mask_path, settings.s3_bucket, mask_s3_key)
 
+            total_frames, _fps = _get_frame_count_and_fps(video_path)
+
         loop.run_until_complete(
             _publish(job_id, {"stage": "segmenting", "pct": 100})
         )
         SEGMENTS_TOTAL.labels(status=f"segmentation_{status}").inc()
+
+        if settings.chunking_enabled:
+            chunks = []
+            for start in range(0, total_frames, CHUNK_SIZE):
+                end = min(start + CHUNK_SIZE, total_frames)
+                chunks.append((start, end))
+            total_chunks = len(chunks)
+
+            bound_log.info(
+                "chunking_video",
+                total_frames=total_frames,
+                total_chunks=total_chunks,
+                chunk_size=CHUNK_SIZE,
+            )
+            SEGMENTS_TOTAL.labels(status="chunking_dispatched").inc()
+
+            from workers.segmentation.chunk_tasks import track_masks_chunk
+            for chunk_index, (start_frame, end_frame) in enumerate(chunks):
+                track_masks_chunk.apply_async(
+                    args=[
+                        job_id,
+                        chunk_index,
+                        total_chunks,
+                        segment_s3_key,
+                        mask_s3_key,
+                        start_frame,
+                        end_frame,
+                    ],
+                    queue="segmentation",
+                )
+
+            loop.run_until_complete(
+                _update_status(job_id, JobStatus.TRACKING, extra={"total_chunks": total_chunks})
+            )
+
+            return {
+                "job_id": job_id,
+                "segment_s3_key": segment_s3_key,
+                "mask_s3_key": mask_s3_key,
+                "total_chunks": total_chunks,
+                "status": status,
+            }
 
         track_masks.apply_async(
             args=[job_id, segment_s3_key, mask_s3_key],
@@ -178,6 +224,17 @@ def track_masks(
 
             tracked_array = _run_xmem_tracking(frames, mask_binary, settings, bound_log)
 
+            from workers.segmentation.oiv_refiner import refine_tracked_masks
+
+            bound_log.info("oiv_refinement_started", num_frames=len(frames))
+            tracked_array = refine_tracked_masks(
+                frames=frames,
+                tracked_masks=tracked_array,
+                model_cache_dir=settings.model_cache_dir,
+                device="cpu",  # CPU to avoid VRAM conflict with SAM2
+            )
+            bound_log.info("oiv_refinement_complete")
+
             tracked_key = f"jobs/{job_id}/masks/tracked_masks.npy"
             tracked_path = os.path.join(tmp, "tracked_masks.npy")
             np.save(tracked_path, tracked_array)
@@ -251,6 +308,17 @@ def _extract_frame(video_path: str, frame_index: int) -> np.ndarray:
 
 
 
+def _get_frame_count_and_fps(video_path: str) -> tuple[int, float]:
+    """Return (total_frames, fps) for the full video via cv2."""
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return total_frames, fps
+
+
 def _extract_all_frames(video_path: str) -> list[np.ndarray]:
     """Read up to MAX_TRACKING_FRAMES frames as (H, W, 3) uint8 RGB arrays."""
     import cv2
@@ -308,7 +376,7 @@ def _run_xmem_tracking(
     network = XMemNetwork(
         xmem_config,
         os.path.join(settings.model_cache_dir, "XMem.pth"),
-    ).cpu().eval()
+    ).cuda().eval()
     processor = InferenceCore(network, config=xmem_config)
     processor.set_all_labels(list(range(1, 2)))  # single object
     bound_log.info("xmem_model_loaded")
@@ -316,10 +384,10 @@ def _run_xmem_tracking(
     tracked_masks: list[np.ndarray] = []
     with torch.no_grad():
         for i, frame_rgb in enumerate(frames):
-            frame_torch, _ = image_to_torch(frame_rgb, device="cpu")
+            frame_torch, _ = image_to_torch(frame_rgb, device="cuda")
             if i == 0:
                 # First frame: seed propagation with the SAM2 mask.
-                mask_torch = index_numpy_to_one_hot_torch(mask_binary, 2)
+                mask_torch = index_numpy_to_one_hot_torch(mask_binary, 2).cuda()
                 output_prob = processor.step(frame_torch, mask_torch[1:2])
             else:
                 output_prob = processor.step(frame_torch)

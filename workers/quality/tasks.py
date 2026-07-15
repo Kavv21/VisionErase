@@ -7,7 +7,6 @@ import structlog
 from celery.exceptions import SoftTimeLimitExceeded
 
 from api.core.metrics import SEGMENTS_TOTAL
-from api.core.redis import acquire_redis, publish_progress, set_job_status
 from api.models.job import JobStatus
 from workers.celery_app import celery_app
 
@@ -111,14 +110,22 @@ async def _update_status(job_id: str, status: str, error: str | None = None, ext
 
 
 async def _complete_job(job_id: str, result_s3_key: str) -> None:
-    async with acquire_redis() as redis:
-        await set_job_status(
-            redis,
-            job_id,
-            {"status": JobStatus.COMPLETED, "result_s3_key": result_s3_key},
-        )
-        await publish_progress(
-            redis,
-            job_id,
-            {"stage": "completed", "pct": 100, "result_s3_key": result_s3_key},
-        )
+    import json as _json
+    from redis import asyncio as _aioredis
+    from api.core.config import get_settings as _get_settings
+    _s = _get_settings()
+    _r = _aioredis.Redis.from_url(_s.redis_url, decode_responses=True)
+    try:
+        key = f"job:status:{job_id}"
+        status = {"status": JobStatus.COMPLETED, "result_s3_key": result_s3_key}
+        await _r.setex(key, _s.redis_result_ttl, _json.dumps(status))
+        channel = f"progress:{job_id}"
+        message = _json.dumps({
+            "type": "progress",
+            "stage": "completed",
+            "pct": 100,
+            "result_s3_key": result_s3_key,
+        })
+        await _r.publish(channel, message)
+    finally:
+        await _r.aclose()

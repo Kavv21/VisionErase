@@ -8,12 +8,14 @@ import StageCard, { type StageStatus } from '../components/StageCard'
 import GlassCard from '../components/GlassCard'
 
 // Message shapes the /ws/{job_id} endpoint actually emits (see api/routers/websocket.py)
+// chunk/total are present once the pipeline splits a long video into chunks
+// (see workers/segmentation/chunk_tasks.py, workers/inpainting/chunk_tasks.py)
 type WsMsg =
-  | { type: 'progress'; stage: string; pct: number }
+  | { type: 'progress'; stage: string; pct: number; chunk?: number; total?: number }
   | { type: 'complete'; result: { result_s3_key: string | null } }
   | { type: 'error'; message: string }
   // pub/sub forwarded messages from workers lack a `type` field
-  | { stage: string; pct: number }
+  | { stage: string; pct: number; chunk?: number; total?: number }
 
 const STAGE_LABELS: Record<string, string> = {
   pending: 'Waiting to start',
@@ -117,6 +119,7 @@ export default function JobProgress() {
   const [connState, setConnState] = useState<ConnectionState>('connecting')
   const [stage, setStage] = useState('pending')
   const [pct, setPct] = useState(0)
+  const [chunkInfo, setChunkInfo] = useState<{ chunk: number; total: number } | null>(null)
   const [isDone, setIsDone] = useState(false)
   const [resultKey, setResultKey] = useState<string | null>(null)
   const [wsError, setWsError] = useState<string | null>(null)
@@ -162,9 +165,15 @@ export default function JobProgress() {
           if (msg.type === 'progress') {
             setStage(msg.stage ?? 'pending')
             setPct(typeof msg.pct === 'number' ? msg.pct : 0)
+            setChunkInfo(
+              typeof msg.chunk === 'number' && typeof msg.total === 'number'
+                ? { chunk: msg.chunk, total: msg.total }
+                : null
+            )
           } else if (msg.type === 'complete') {
             setStage('completed')
             setPct(100)
+            setChunkInfo(null)
             setResultKey(msg.result?.result_s3_key ?? null)
             setIsDone(true)
             ws.close()
@@ -177,6 +186,11 @@ export default function JobProgress() {
           // pub/sub forwarded worker event
           setStage(msg.stage ?? 'pending')
           setPct(typeof msg.pct === 'number' ? msg.pct : 0)
+          setChunkInfo(
+            typeof msg.chunk === 'number' && typeof msg.total === 'number'
+              ? { chunk: msg.chunk, total: msg.total }
+              : null
+          )
         }
       })
 
@@ -223,6 +237,8 @@ export default function JobProgress() {
         } else {
           setStage(data.status)
           setPct(data.progress_pct)
+          // REST status has no chunk granularity — drop any stale chunk label
+          setChunkInfo(null)
         }
       } catch {
         // transient polling error — the next tick will retry
@@ -240,17 +256,30 @@ export default function JobProgress() {
     }
   }, [isDone, wsError, jobId, navigate])
 
+  // Chunk-aware label, e.g. "Tracking chunk 2 of 5" once the pipeline has
+  // split the video into chunks (see workers/*/chunk_tasks.py).
+  const stageLabel = chunkInfo
+    ? `${STAGE_LABELS[stage] ?? stage} — chunk ${chunkInfo.chunk + 1} of ${chunkInfo.total}`
+    : STAGE_LABELS[stage] ?? stage
+
+  // Overall progress across all chunks: completed chunks + current chunk's
+  // own pct, out of the total chunk count.
+  const displayPct = chunkInfo
+    ? Math.round(((chunkInfo.chunk + pct / 100) / chunkInfo.total) * 100)
+    : pct
+
   // Purely visual: append a timestamped line to the processing log whenever
-  // the displayed stage changes. Does not affect WS/polling behavior.
+  // the displayed stage (or chunk within a stage) changes. Does not affect
+  // WS/polling behavior.
   const [log, setLog] = useState<LogLine[]>([])
-  const lastLoggedStage = useRef<string | null>(null)
+  const lastLoggedKeyRef = useRef<string | null>(null)
   useEffect(() => {
-    if (lastLoggedStage.current === stage) return
-    lastLoggedStage.current = stage
+    const key = chunkInfo ? `${stage}:${chunkInfo.chunk}` : stage
+    if (lastLoggedKeyRef.current === key) return
+    lastLoggedKeyRef.current = key
     const time = new Date().toLocaleTimeString([], { hour12: false })
-    const label = STAGE_LABELS[stage] ?? stage
-    setLog((prev) => [...prev, { time, message: label }])
-  }, [stage])
+    setLog((prev) => [...prev, { time, message: stageLabel }])
+  }, [stage, chunkInfo, stageLabel])
   const logEndRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -283,7 +312,7 @@ export default function JobProgress() {
           </GlassCard>
         ) : (
           <div className="flex justify-center mb-8">
-            <ProgressRing percent={pct} />
+            <ProgressRing percent={displayPct} />
           </div>
         )}
 

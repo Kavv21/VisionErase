@@ -16,8 +16,18 @@ export interface MaskData {
   frame_index: number
 }
 
+// A SAM2 prompt point: label 1 = positive (include), -1 = negative (exclude)
+export interface SAM2Point {
+  x: number
+  y: number
+  label: 1 | -1
+}
+
 export interface SegmentPreviewResponse {
-  mask_points: MaskPoint[]
+  mask_base64: string
+  score: number
+  width: number
+  height: number
   stub: boolean
 }
 
@@ -83,12 +93,12 @@ export async function apiUploadVideo(
 
 export async function apiSegmentPreview(
   videoS3Key: string,
-  point: MaskPoint,
+  points: SAM2Point[],
   frameIndex = 0
 ): Promise<SegmentPreviewResponse> {
   const { data } = await apiClient.post<SegmentPreviewResponse>('/api/v1/segment/preview', {
     video_s3_key: videoS3Key,
-    point,
+    points,
     frame_index: frameIndex,
   })
   return data

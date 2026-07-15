@@ -8,7 +8,7 @@ import numpy as np
 import structlog
 import torch
 
-from models.boundary_fusion.architecture import BoundaryFusion
+from visionerase_models.boundary_fusion.architecture import BoundaryFusion
 
 log = structlog.get_logger(__name__)
 

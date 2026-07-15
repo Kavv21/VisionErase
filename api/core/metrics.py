@@ -112,7 +112,18 @@ AUTH_LOGINS_TOTAL = Counter(
 
 SEGMENT_PREVIEW_REQUESTS_TOTAL = Counter(
     "visionerase_segment_preview_requests_total",
-    "Total segment preview requests (stub mode, SAM 2 not yet integrated)",
+    "Total segment preview requests (real-time SAM2 mask preview)",
+)
+
+SEGMENT_PREVIEW_ERRORS_TOTAL = Counter(
+    "visionerase_segment_preview_errors_total",
+    "Total segment preview requests that failed",
+)
+
+SEGMENT_PREVIEW_LATENCY_SECONDS = Histogram(
+    "visionerase_segment_preview_latency_seconds",
+    "Time to run real-time SAM2 segmentation for one preview request",
+    buckets=[0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0],
 )
 
 UPLOAD_REQUESTS_TOTAL = Counter(

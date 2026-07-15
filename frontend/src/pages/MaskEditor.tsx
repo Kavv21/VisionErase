@@ -3,9 +3,9 @@ import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '../store/authStore'
 import { useUploadStore } from '../store/uploadStore'
 import { apiSegmentPreview, apiCreateJob } from '../api/jobs'
-import type { MaskPoint } from '../api/jobs'
+import type { MaskPoint, SAM2Point } from '../api/jobs'
 
-type Tool = 'point' | 'brush' | 'eraser'
+type Tool = 'point' | 'brush' | 'eraser' | 'sam2'
 
 // Convert a pointer event position to native video-pixel coordinates.
 // The canvas internal size equals the video's native resolution, so this
@@ -37,7 +37,38 @@ function clientToCanvasCoords(
   }
 }
 
+// Recolor a grayscale (0/255) mask PNG into a semi-transparent purple overlay,
+// scaled to the target canvas size. Runs synchronously once the image has loaded.
+function tintMaskPurple(img: HTMLImageElement, targetW: number, targetH: number): HTMLCanvasElement {
+  const off = document.createElement('canvas')
+  off.width = img.naturalWidth
+  off.height = img.naturalHeight
+  const octx = off.getContext('2d')!
+  octx.drawImage(img, 0, 0)
+  const imgData = octx.getImageData(0, 0, off.width, off.height)
+  const data = imgData.data
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i] > 127) {
+      data[i] = 124
+      data[i + 1] = 58
+      data[i + 2] = 237
+      data[i + 3] = Math.round(0.4 * 255)
+    } else {
+      data[i + 3] = 0
+    }
+  }
+  octx.putImageData(imgData, 0, 0)
+
+  if (off.width === targetW && off.height === targetH) return off
+  const scaled = document.createElement('canvas')
+  scaled.width = targetW
+  scaled.height = targetH
+  scaled.getContext('2d')!.drawImage(off, 0, 0, targetW, targetH)
+  return scaled
+}
+
 const BRUSH_RADIUS = 12  // canvas-space radius, scales with video resolution
+const SAM2_POINT_RADIUS = 5  // canvas-space radius for positive/negative point dots
 
 export default function MaskEditor() {
   const { isAuthenticated } = useAuthStore()
@@ -55,8 +86,14 @@ export default function MaskEditor() {
   const [maskPoints, setMaskPoints] = useState<MaskPoint[]>([])
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewClickPos, setPreviewClickPos] = useState<{ x: number; y: number } | null>(null)
-  const [showStubBadge, setShowStubBadge] = useState(false)
   const [submitError, setSubmitError] = useState<string | null>(null)
+
+  // SAM2 interactive segmentation state
+  const [sam2Points, setSam2Points] = useState<SAM2Point[]>([])
+  const [sam2Mode, setSam2Mode] = useState<1 | -1>(1)  // label used by a plain left-click
+  const [sam2Loading, setSam2Loading] = useState(false)
+  const [sam2Score, setSam2Score] = useState<number | null>(null)
+  const [sam2Error, setSam2Error] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [totalFrames, setTotalFrames] = useState(0)
   const [currentFrame, setCurrentFrame] = useState(0)
@@ -139,26 +176,45 @@ export default function MaskEditor() {
     [totalFrames]
   )
 
-  // Draw the returned preview polygon on the mask canvas
-  const drawPreviewPolygon = useCallback((points: MaskPoint[]) => {
-    const maskCanvas = maskCanvasRef.current
-    if (!maskCanvas || points.length < 2) return
-    const ctx = maskCanvas.getContext('2d')
-    if (!ctx) return
+  // Draw a SAM2 mask (purple overlay) plus positive/negative point dots on the mask canvas.
+  const drawMaskOverlay = useCallback(
+    (maskBase64: string | null, points: SAM2Point[]) => {
+      const maskCanvas = maskCanvasRef.current
+      if (!maskCanvas) return
+      const ctx = maskCanvas.getContext('2d')
+      if (!ctx) return
 
-    ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height)
-    ctx.beginPath()
-    ctx.moveTo(points[0].x, points[0].y)
-    for (let i = 1; i < points.length; i++) {
-      ctx.lineTo(points[i].x, points[i].y)
-    }
-    ctx.closePath()
-    ctx.fillStyle = 'rgba(124, 58, 237, 0.35)'
-    ctx.strokeStyle = 'rgba(124, 58, 237, 0.85)'
-    ctx.lineWidth = 2
-    ctx.fill()
-    ctx.stroke()
-  }, [])
+      const drawPoints = () => {
+        for (const p of points) {
+          const cx = (p.x / videoSize.w) * maskCanvas.width
+          const cy = (p.y / videoSize.h) * maskCanvas.height
+          ctx.beginPath()
+          ctx.arc(cx, cy, SAM2_POINT_RADIUS, 0, Math.PI * 2)
+          ctx.fillStyle = p.label === 1 ? '#22C55E' : '#EF4444'
+          ctx.fill()
+          ctx.strokeStyle = 'rgba(0,0,0,0.6)'
+          ctx.lineWidth = 1
+          ctx.stroke()
+        }
+      }
+
+      if (!maskBase64) {
+        ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height)
+        drawPoints()
+        return
+      }
+
+      const img = new Image()
+      img.onload = () => {
+        ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height)
+        const tinted = tintMaskPurple(img, maskCanvas.width, maskCanvas.height)
+        ctx.drawImage(tinted, 0, 0)
+        drawPoints()
+      }
+      img.src = `data:image/png;base64,${maskBase64}`
+    },
+    [videoSize]
+  )
 
   const handlePointClick = useCallback(
     async (clientX: number, clientY: number) => {
@@ -173,11 +229,11 @@ export default function MaskEditor() {
         maskCanvasRef.current,
         videoSize.w, videoSize.h
       )
+      const promptPoint: SAM2Point = { ...videoPoint, label: 1 }
 
       try {
-        const response = await apiSegmentPreview(s3Key, videoPoint, currentFrame)
-        drawPreviewPolygon(response.mask_points)
-        if (response.stub) setShowStubBadge(true)
+        const response = await apiSegmentPreview(s3Key, [promptPoint], currentFrame)
+        drawMaskOverlay(response.mask_base64, [promptPoint])
         // Add the clicked point to the mask data
         setMaskPoints((prev) => [...prev, videoPoint])
       } catch {
@@ -187,8 +243,47 @@ export default function MaskEditor() {
         setPreviewClickPos(null)
       }
     },
-    [s3Key, frameReady, videoSize, currentFrame, drawPreviewPolygon]
+    [s3Key, frameReady, videoSize, currentFrame, drawMaskOverlay]
   )
+
+  const handleSam2Click = useCallback(
+    async (clientX: number, clientY: number, explicitLabel?: 1 | -1) => {
+      if (!maskCanvasRef.current || !s3Key || !frameReady) return
+
+      const videoPoint = canvasToVideoCoords(
+        clientX, clientY,
+        maskCanvasRef.current,
+        videoSize.w, videoSize.h
+      )
+      const label = explicitLabel ?? sam2Mode
+      const nextPoints = [...sam2Points, { ...videoPoint, label }]
+      setSam2Points(nextPoints)
+      setSam2Loading(true)
+      setSam2Error(null)
+
+      try {
+        const response = await apiSegmentPreview(s3Key, nextPoints, currentFrame)
+        setSam2Score(response.score)
+        drawMaskOverlay(response.mask_base64, nextPoints)
+      } catch {
+        setSam2Error('Segmentation failed — try again or switch to the brush tool.')
+        drawMaskOverlay(null, nextPoints)
+      } finally {
+        setSam2Loading(false)
+      }
+    },
+    [s3Key, frameReady, videoSize, currentFrame, sam2Points, sam2Mode, drawMaskOverlay]
+  )
+
+  const handleClearSam2Points = useCallback(() => {
+    setSam2Points([])
+    setSam2Score(null)
+    setSam2Error(null)
+    const maskCanvas = maskCanvasRef.current
+    if (maskCanvas) {
+      maskCanvas.getContext('2d')?.clearRect(0, 0, maskCanvas.width, maskCanvas.height)
+    }
+  }, [])
 
   const handleBrushMove = useCallback(
     (clientX: number, clientY: number, isErase: boolean) => {
@@ -227,12 +322,16 @@ export default function MaskEditor() {
     if (!ctx) return
     ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height)
     setMaskPoints([])
-    setShowStubBadge(false)
+    setSam2Points([])
+    setSam2Score(null)
+    setSam2Error(null)
   }, [])
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (tool === 'point') {
       handlePointClick(e.clientX, e.clientY)
+    } else if (tool === 'sam2') {
+      handleSam2Click(e.clientX, e.clientY, e.button === 2 ? -1 : undefined)
     } else {
       setIsDrawing(true)
       handleBrushMove(e.clientX, e.clientY, tool === 'eraser')
@@ -240,7 +339,7 @@ export default function MaskEditor() {
   }
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isDrawing || tool === 'point') return
+    if (!isDrawing || tool === 'point' || tool === 'sam2') return
     handleBrushMove(e.clientX, e.clientY, tool === 'eraser')
   }
 
@@ -252,8 +351,17 @@ export default function MaskEditor() {
     setSubmitting(true)
 
     try {
+      // If a SAM2 mask was generated, its positive points drive real
+      // re-segmentation on the backend job pipeline; any brush edits made
+      // afterwards (in maskPoints) refine that mask further.
+      const sam2PositivePoints = sam2Points
+        .filter((p) => p.label === 1)
+        .map(({ x, y }) => ({ x, y }))
+      const submittedPoints =
+        sam2PositivePoints.length > 0 ? [...sam2PositivePoints, ...maskPoints] : maskPoints
+
       const result = await apiCreateJob(s3Key, {
-        points: maskPoints,
+        points: submittedPoints,
         frame_index: currentFrame,
       })
       setJobId(result.job_id)
@@ -307,6 +415,11 @@ export default function MaskEditor() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
             </svg>
           </button>
+          <button onClick={() => setTool('sam2')} className={toolButtonClass(tool === 'sam2')} title="SAM2 (click to segment)">
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456z" />
+            </svg>
+          </button>
           <div className="w-6 h-px bg-white/10 my-1" />
           <button onClick={handleClearAll} className={toolButtonClass(false)} title="Clear All">
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -318,10 +431,43 @@ export default function MaskEditor() {
         {/* Center canvas area */}
         <div className="flex-1 flex flex-col min-w-0">
           <div className="flex-1 flex items-center justify-center p-6 relative overflow-auto">
-            {showStubBadge && (
-              <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 inline-flex items-center gap-2 px-3 py-1.5 backdrop-blur-xl bg-amber-500/10 border border-amber-500/30 rounded-full text-xs text-amber-400 font-medium">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-                Preview mode — full AI segmentation coming soon
+            {tool === 'sam2' && (
+              <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 px-3 py-1.5 backdrop-blur-xl bg-white/[0.04] border border-white/10 rounded-full text-xs">
+                <button
+                  onClick={() => setSam2Mode((m) => (m === 1 ? -1 : 1))}
+                  className={`px-2 py-0.5 rounded-full font-medium transition-colors ${
+                    sam2Mode === 1
+                      ? 'bg-emerald-500/15 text-emerald-400'
+                      : 'bg-red-500/15 text-red-400'
+                  }`}
+                  title="Left-click uses this label. Right-click is always negative."
+                >
+                  {sam2Mode === 1 ? '+ Positive' : '− Negative'}
+                </button>
+                <button
+                  onClick={handleClearSam2Points}
+                  className="px-2 py-0.5 rounded-full text-[#A0A0B0] hover:text-white hover:bg-white/5 font-medium"
+                >
+                  Clear Points
+                </button>
+                {sam2Loading && (
+                  <span className="inline-flex items-center gap-1.5 text-[#A78BFA] font-medium">
+                    <span className="w-3 h-3 rounded-full border-2 border-[#A78BFA] border-t-transparent animate-spin" />
+                    Segmenting…
+                  </span>
+                )}
+                {!sam2Loading && sam2Score !== null && (
+                  <span
+                    className={`px-2 py-0.5 rounded-full font-mono font-medium ${
+                      sam2Score >= 0.7
+                        ? 'bg-emerald-500/15 text-emerald-400'
+                        : 'bg-amber-500/15 text-amber-400'
+                    }`}
+                  >
+                    Confidence: {Math.round(sam2Score * 100)}%
+                  </span>
+                )}
+                {sam2Error && <span className="text-[#EF4444] font-medium">{sam2Error}</span>}
               </div>
             )}
 
@@ -346,12 +492,20 @@ export default function MaskEditor() {
                 className="block absolute inset-0 max-w-full max-h-[calc(100vh-220px)] w-full h-full"
                 style={{
                   display: frameReady ? 'block' : 'none',
-                  cursor: tool === 'point' ? 'crosshair' : tool === 'eraser' ? 'cell' : 'default',
+                  cursor:
+                    tool === 'point' || tool === 'sam2'
+                      ? 'crosshair'
+                      : tool === 'eraser'
+                        ? 'cell'
+                        : 'default',
                 }}
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
                 onPointerUp={handlePointerUp}
                 onPointerLeave={handlePointerUp}
+                onContextMenu={(e) => {
+                  if (tool === 'sam2') e.preventDefault()
+                }}
               />
               {/* Loading dot at click position for point tool */}
               {previewLoading && previewClickPos && (
@@ -384,6 +538,7 @@ export default function MaskEditor() {
             </span>
             <span className="text-xs text-[#A0A0B0] shrink-0">
               {maskPoints.length} point{maskPoints.length !== 1 ? 's' : ''} marked
+              {sam2Points.length > 0 && ` · ${sam2Points.length} SAM2 point${sam2Points.length !== 1 ? 's' : ''}`}
             </span>
             {submitError && (
               <span className="text-xs text-[#EF4444] shrink-0">{submitError}</span>

@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     max_video_duration_sec: int = 3600
     max_video_size_mb: int = 2000
 
+    # Full-video frame chunking (tracking/inpainting long videos in parallel chunks)
+    chunking_enabled: bool = True
+
     # CORS
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
@@ -74,6 +77,9 @@ class Settings(BaseSettings):
     boundary_window_frames: int = 10
     boundary_fusion_enabled: bool = True
     boundary_fusion_weights: str = "/app/model_weights/boundary_fusion.pt"
+
+    # Modal high-resolution inpainting
+    modal_enabled: bool = True
 
 
 @lru_cache

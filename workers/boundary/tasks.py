@@ -175,7 +175,7 @@ def _run_fusion_model(
     bound_log: Any,
 ) -> np.ndarray:
     """Load BoundaryFusion from the model pool and run inference."""
-    from models.boundary_fusion.inference import run_boundary_fusion
+    from visionerase_models.boundary_fusion.inference import run_boundary_fusion
 
     # Rule: always load models through the model pool
     from pipeline.pool.model_pool import get_model_pool
