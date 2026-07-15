@@ -6,7 +6,7 @@ import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.core.metrics import WEBSOCKET_CONNECTIONS_ACTIVE
-from api.core.redis import acquire_redis, get_job_status
+from api.core.redis import acquire_redis, get_job_progress, get_job_status
 
 log = structlog.get_logger(__name__)
 router = APIRouter(tags=["websocket"])
@@ -30,6 +30,7 @@ async def job_progress(websocket: WebSocket, job_id: str) -> None:
         try:
             async with acquire_redis() as redis:
                 status = await get_job_status(redis, job_id)
+                latest_progress = await get_job_progress(redis, job_id)
         except RuntimeError:
             await websocket.send_json({"type": "error", "message": "service unavailable"})
             return
@@ -57,12 +58,17 @@ async def job_progress(websocket: WebSocket, job_id: str) -> None:
             bound_log.info("ws_job_already_failed")
             return
 
-        # Send in-progress snapshot so the client has something immediately
-        await websocket.send_json({
-            "type": "progress",
-            "stage": current_status,
-            "pct": status.get("progress_pct", 0.0),
-        })
+        # Send in-progress snapshot so the client has something immediately.
+        # Prefer the last stored worker progress event — it carries chunk-level
+        # detail (stage, chunk, total, pct) that the status key lacks.
+        if latest_progress is not None:
+            await websocket.send_json(latest_progress)
+        else:
+            await websocket.send_json({
+                "type": "progress",
+                "stage": current_status,
+                "pct": status.get("progress_pct", 0.0),
+            })
 
         # ── Subscribe to Redis pub/sub and stream events ───────────────────────
         try:

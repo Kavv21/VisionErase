@@ -1,130 +1,124 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import os
 import tempfile
 import time
 from typing import Any
 
-import numpy as np
 import structlog
 from celery.exceptions import SoftTimeLimitExceeded
 
 from api.core.config import get_settings
-from api.core.metrics import BOUNDARY_FUSION_TIME, BOUNDARY_QUALITY_SCORE, SEGMENTS_TOTAL
-from api.core.redis import acquire_redis, publish_progress, set_job_status
+from api.core.metrics import BOUNDARY_FUSION_TIME, SEGMENTS_TOTAL
+from workers.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
-
-# Import celery_app lazily to avoid circular imports at module load time.
-# tasks.py is collected by the worker process which already has the app configured.
-from workers.celery_app import celery_app  # noqa: E402
 
 
 @celery_app.task(
     bind=True,
     queue="boundary",
     max_retries=2,
-    soft_time_limit=120,
-    time_limit=150,
+    soft_time_limit=300,
+    time_limit=360,
     name="workers.boundary.tasks.apply_boundary_fusion",
 )
 def apply_boundary_fusion(
     self,
     job_id: str,
-    segment_a_s3_key: str,
-    segment_b_s3_key: str,
-    segment_index: int,
+    stitched_s3_key: str,
 ) -> dict[str, Any]:
-    """Correct temporal discontinuities at the boundary between two adjacent segments.
+    """Correct temporal discontinuities at every chunk boundary of the stitched video.
 
-    Downloads the tail of segment A and the head of segment B, runs BoundaryFusion
-    cross-segment attention, and uploads the corrected boundary frames to S3.
-    Returns a dict with corrected_frames_s3_key.
+    Downloads all inpainted chunks, runs BoundaryFusion on each adjacent pair's
+    boundary frames, uploads the corrected full video, then chains to
+    quality_check_final. If only one chunk exists there are no boundaries to
+    fix; if fusion fails, the stitched video is passed through unchanged.
     """
-    import asyncio
-
-    import boto3
-    from botocore.config import Config
-
     settings = get_settings()
-    bound_log = log.bind(
-        job_id=job_id,
-        segment_index=segment_index,
-        task_id=self.request.id,
-    )
-    bound_log.info("boundary_fusion_started")
+    bound_log = log.bind(job_id=job_id, task_id=self.request.id)
+    bound_log.info("boundary_fusion_started", stitched_s3_key=stitched_s3_key)
 
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(
-            _publish(job_id, {"stage": "boundary_fusion", "segment": segment_index, "pct": 0})
+            _publish(job_id, {"stage": "boundary_fusion", "pct": 0})
         )
+        SEGMENTS_TOTAL.labels(status="boundary_fusion_started").inc()
 
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=settings.s3_endpoint_url,
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            config=Config(signature_version="s3v4"),
-        )
+        s3 = _make_s3_client(settings)
+        result_s3_key = stitched_s3_key
+        status = "boundary_fusion_applied"
 
-        t0 = time.perf_counter()
+        try:
+            chunk_keys = _list_chunk_keys(s3, settings.s3_bucket, job_id)
+            bound_log.info("boundary_chunks_found", num_chunks=len(chunk_keys))
 
-        with tempfile.TemporaryDirectory() as tmp:
-            seg_a_path = os.path.join(tmp, "seg_a.mp4")
-            seg_b_path = os.path.join(tmp, "seg_b.mp4")
-
-            s3.download_file(settings.s3_bucket, segment_a_s3_key, seg_a_path)
-            s3.download_file(settings.s3_bucket, segment_b_s3_key, seg_b_path)
-
-            frames_a = _read_tail_frames(seg_a_path, settings.boundary_window_frames)
-            frames_b = _read_head_frames(seg_b_path, settings.boundary_window_frames)
-
-            if settings.boundary_fusion_enabled:
-                corrected = _run_fusion_model(frames_a, frames_b, settings, bound_log)
-                method = "boundary_fusion"
+            if len(chunk_keys) < 2:
+                # Single chunk (or none) → no boundaries to correct
+                status = "skipped_no_boundaries"
+                SEGMENTS_TOTAL.labels(status="boundary_fusion_skipped").inc()
+                bound_log.info("boundary_fusion_skipped_single_chunk")
             else:
-                corrected = _overlap_blend(frames_a, frames_b)
-                method = "overlap_blend"
-                bound_log.info("boundary_fusion_disabled_using_blend")
+                t0 = time.perf_counter()
+                with tempfile.TemporaryDirectory() as tmp:
+                    chunk_paths = []
+                    for i, chunk_key in enumerate(chunk_keys):
+                        chunk_path = os.path.join(tmp, f"chunk_{i:04d}.mp4")
+                        s3.download_file(settings.s3_bucket, chunk_key, chunk_path)
+                        chunk_paths.append(chunk_path)
 
-            dest_key = f"jobs/{job_id}/boundaries/boundary_{segment_index}.npy"
-            npy_path = os.path.join(tmp, "boundary.npy")
-            np.save(npy_path, corrected)
-            s3.upload_file(npy_path, settings.s3_bucket, dest_key)
+                    output_path = os.path.join(tmp, "output.mp4")
+                    _run_fusion_on_chunks(chunk_paths, output_path, settings, bound_log)
 
-        elapsed = time.perf_counter() - t0
-        BOUNDARY_FUSION_TIME.observe(elapsed)
-        SEGMENTS_TOTAL.labels(status="boundary_corrected").inc()
+                    result_s3_key = f"jobs/{job_id}/result/output.mp4"
+                    s3.upload_file(output_path, settings.s3_bucket, result_s3_key)
 
-        # Score boundary quality (mean SSIM proxy: pixel variance ratio)
-        quality_score = float(np.clip(1.0 - np.std(corrected.astype(float) / 255.0), 0.0, 1.0))
-        BOUNDARY_QUALITY_SCORE.observe(quality_score)
+                elapsed = time.perf_counter() - t0
+                BOUNDARY_FUSION_TIME.observe(elapsed)
+                SEGMENTS_TOTAL.labels(status="boundary_fusion_complete").inc()
+                bound_log.info(
+                    "boundary_fusion_complete",
+                    elapsed_sec=round(elapsed, 3),
+                    result_s3_key=result_s3_key,
+                    num_boundaries=len(chunk_keys) - 1,
+                )
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as exc:
+            # Graceful degradation: keep the uncorrected stitched video
+            bound_log.exception("boundary_fusion_failed_falling_back", error=str(exc))
+            SEGMENTS_TOTAL.labels(status="boundary_fusion_fallback").inc()
+            result_s3_key = stitched_s3_key
+            status = "boundary_fusion_failed_passthrough"
 
         loop.run_until_complete(
-            _publish(job_id, {"stage": "boundary_fusion", "segment": segment_index, "pct": 100})
+            _publish(job_id, {"stage": "boundary_fusion", "pct": 100})
         )
 
-        bound_log.info(
-            "boundary_fusion_complete",
-            method=method,
-            elapsed_sec=round(elapsed, 3),
-            dest_key=dest_key,
-            quality_score=round(quality_score, 4),
+        from workers.quality.tasks import quality_check_final
+        quality_check_final.apply_async(
+            args=[job_id, result_s3_key],
+            queue="quality",
         )
-        return {"corrected_frames_s3_key": dest_key, "method": method}
+
+        return {
+            "job_id": job_id,
+            "result_s3_key": result_s3_key,
+            "status": status,
+        }
 
     except SoftTimeLimitExceeded:
         bound_log.error("boundary_fusion_soft_timeout")
-        SEGMENTS_TOTAL.labels(status="boundary_timeout").inc()
+        SEGMENTS_TOTAL.labels(status="boundary_fusion_timeout").inc()
         loop.run_until_complete(
-            _update_status(job_id, "failed", "BoundaryFusion timed out")
+            _update_status(job_id, "failed", "apply_boundary_fusion timed out")
         )
         raise
     except Exception as exc:
         bound_log.exception("boundary_fusion_error", error=str(exc))
-        SEGMENTS_TOTAL.labels(status="boundary_error").inc()
+        SEGMENTS_TOTAL.labels(status="boundary_fusion_error").inc()
         loop.run_until_complete(
             _update_status(job_id, "failed", str(exc))
         )
@@ -135,74 +129,94 @@ def apply_boundary_fusion(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _read_tail_frames(video_path: str, n: int) -> np.ndarray:
-    """Return the last n frames of a video as (n, H, W, 3) uint8 array."""
-    import cv2
-
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    start = max(0, total - n)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-    frames = []
-    for _ in range(n):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    cap.release()
-    return np.stack(frames)
-
-
-def _read_head_frames(video_path: str, n: int) -> np.ndarray:
-    """Return the first n frames of a video as (n, H, W, 3) uint8 array."""
-    import cv2
-
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    for _ in range(n):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    cap.release()
-    return np.stack(frames)
-
-
-def _run_fusion_model(
-    frames_a: np.ndarray,
-    frames_b: np.ndarray,
+def _run_fusion_on_chunks(
+    chunk_paths: list[str],
+    output_path: str,
     settings: Any,
     bound_log: Any,
-) -> np.ndarray:
-    """Load BoundaryFusion from the model pool and run inference."""
-    from visionerase_models.boundary_fusion.inference import run_boundary_fusion
+) -> None:
+    """Acquire BoundaryFusion from the model pool and fuse all chunk boundaries."""
+    from visionerase_models.boundary_fusion.inference import (
+        WEIGHTS_FILENAME,
+        load_boundary_fusion_model,
+        run_boundary_fusion_on_chunks,
+    )
 
     # Rule: always load models through the model pool
     from pipeline.pool.model_pool import get_model_pool
 
+    weights_path = os.path.join(settings.model_cache_dir, WEIGHTS_FILENAME)
     pool = get_model_pool()
-    with pool.acquire("boundary_fusion", settings.boundary_fusion_weights) as model:
+    # Small model (890K params) — CPU inference is fast, no VRAM needed
+    pool.register_loader(
+        "boundary_fusion",
+        lambda: load_boundary_fusion_model(weights_path, device="cpu"),
+    )
+    with pool.acquire("boundary_fusion") as model:
         bound_log.info("boundary_fusion_model_acquired")
-        return run_boundary_fusion(model, frames_a, frames_b)
+        run_boundary_fusion_on_chunks(chunk_paths, output_path, model=model)
 
 
-def _overlap_blend(frames_a: np.ndarray, frames_b: np.ndarray) -> np.ndarray:
-    """Fallback: linearly blend the tail of A into the head of B."""
-    n = len(frames_a)
-    blended = []
-    for i in range(n):
-        alpha = i / max(n - 1, 1)
-        frame = ((1 - alpha) * frames_a[i] + alpha * frames_b[i]).astype(np.uint8)
-        blended.append(frame)
-    # Append segment B frames unchanged after the blend window
-    return np.concatenate([np.stack(blended), frames_b], axis=0)
+def _list_chunk_keys(s3: Any, bucket: str, job_id: str) -> list[str]:
+    """Return all inpainted chunk keys for a job, ordered by chunk index."""
+    prefix = f"jobs/{job_id}/chunks/"
+    keys: list[str] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/inpainted_chunk.mp4"):
+                keys.append(key)
+    return sorted(keys, key=lambda k: int(k[len(prefix):].split("/")[0]))
+
+
+def _make_s3_client(settings: Any) -> Any:
+    """Return a boto3 S3 client configured for the MinIO endpoint."""
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        config=Config(signature_version="s3v4"),
+    )
 
 
 async def _publish(job_id: str, data: dict) -> None:
-    async with acquire_redis() as redis:
-        await publish_progress(redis, job_id, data)
+    from redis import asyncio as _aioredis
+    import json as _json
+    from api.core.config import get_settings as _get_settings
+    _s = _get_settings()
+    _r = _aioredis.Redis.from_url(_s.redis_url, decode_responses=True)
+    try:
+        channel = f"progress:{job_id}"
+        message = _json.dumps({"type": "progress", **data})
+        # Persist the latest progress event so REST polling and WebSocket
+        # snapshots can report it (read back via api.core.redis.get_job_progress)
+        await _r.setex(f"job:progress:{job_id}", _s.redis_result_ttl, message)
+        await _r.publish(channel, message)
+    finally:
+        await _r.aclose()
 
 
-async def _update_status(job_id: str, status: str, error: str) -> None:
-    async with acquire_redis() as redis:
-        await set_job_status(redis, job_id, {"status": status, "error": error})
+async def _update_status(job_id: str, status: str, error: str | None = None, extra: dict | None = None) -> None:
+    import json as _json
+    from redis import asyncio as _aioredis
+    from api.core.config import get_settings as _get_settings
+    _s = _get_settings()
+    status_str = status.value if hasattr(status, "value") else str(status)
+    _r = _aioredis.Redis.from_url(_s.redis_url, decode_responses=True)
+    try:
+        key = f"job:status:{job_id}"
+        existing_raw = await _r.get(key)
+        existing = _json.loads(existing_raw) if existing_raw else {}
+        existing["status"] = status_str
+        if error is not None:
+            existing["error"] = error
+        if extra:
+            existing.update(extra)
+        await _r.setex(key, _s.redis_result_ttl, _json.dumps(existing))
+    finally:
+        await _r.aclose()

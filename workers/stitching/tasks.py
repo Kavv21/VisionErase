@@ -145,10 +145,10 @@ def stitch_all_chunks(
         )
         SEGMENTS_TOTAL.labels(status="chunk_stitching_complete").inc()
 
-        from workers.quality.tasks import quality_check_final
-        quality_check_final.apply_async(
+        from workers.boundary.tasks import apply_boundary_fusion
+        apply_boundary_fusion.apply_async(
             args=[job_id, result_s3_key],
-            queue="quality",
+            queue="boundary",
         )
 
         return {
@@ -201,6 +201,9 @@ async def _publish(job_id: str, data: dict) -> None:
     try:
         channel = f"progress:{job_id}"
         message = _json.dumps({"type": "progress", **data})
+        # Persist the latest progress event so REST polling and WebSocket
+        # snapshots can report it (read back via api.core.redis.get_job_progress)
+        await _r.setex(f"job:progress:{job_id}", _s.redis_result_ttl, message)
         await _r.publish(channel, message)
     finally:
         await _r.aclose()

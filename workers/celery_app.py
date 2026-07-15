@@ -151,10 +151,9 @@ def build_pipeline_chain(job_id: str, payload: dict) -> chain:
     segment_chord = chord(
         header=group(process_segment.s(job_id, i) for i in range(n)),
         body=chain(
-            # apply_boundary_fusion is called once per boundary (N-1 per run).
-            # Placeholder: actual segment S3 keys and boundary index are passed
-            # at runtime by the preceding dispatcher; si() ignores chord result.
-            apply_boundary_fusion.si(job_id, "", "", 0),
+            # Placeholder: the stitched S3 key is passed at runtime by the
+            # preceding dispatcher; si() ignores the chord result.
+            apply_boundary_fusion.si(job_id, ""),
             final_stitch.si(job_id),
             quality_check.si(job_id),
         ),

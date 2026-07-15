@@ -18,10 +18,12 @@ from api.core.metrics import (
     UPLOAD_REQUESTS_TOTAL,
     UPLOAD_URL_REQUESTS_TOTAL,
 )
+from api.core.progress import compute_overall_pct
 from api.core.redis import (
     compute_job_hash,
     enqueue_job,
     get_cached_result,
+    get_job_progress,
     get_job_status,
     get_redis,
     set_job_status,
@@ -136,17 +138,29 @@ async def get_job(job_id: str, redis: RedisDep) -> JobResponse:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
     bound_log.debug("job_status_fetched", job_status=status_data.get("status"))
+
+    # Overall progress: completed jobs are 100%; in-flight jobs are computed
+    # from the latest worker progress event (chunk-level granularity).
+    status_val = status_data.get("status", "pending")
+    progress_pct = float(status_data.get("progress_pct", 0.0))
+    if status_val == JobStatus.COMPLETED:
+        progress_pct = 100.0
+    elif status_val not in (JobStatus.PENDING, JobStatus.FAILED):
+        latest_progress = await get_job_progress(redis, job_id)
+        if latest_progress is not None:
+            progress_pct = compute_overall_pct(latest_progress)
+
     return JobResponse(
-   	job_id=status_data.get("job_id", job_id),
-    	status=JobStatus(status_data.get("status", "pending")),
-    	progress_pct=status_data.get("progress_pct", 0.0),
-    	created_at=datetime.fromisoformat(
-        	status_data.get("created_at", datetime.now(timezone.utc).isoformat())
-   	 ),
-    	result_s3_key=status_data.get("result_s3_key"),
-    	error=status_data.get("error"),
-    	cached=status_data.get("cached", False),
- )
+        job_id=status_data.get("job_id", job_id),
+        status=JobStatus(status_val),
+        progress_pct=progress_pct,
+        created_at=datetime.fromisoformat(
+            status_data.get("created_at", datetime.now(timezone.utc).isoformat())
+        ),
+        result_s3_key=status_data.get("result_s3_key"),
+        error=status_data.get("error"),
+        cached=status_data.get("cached", False),
+    )
 
 
 @router.get("/{job_id}/download", response_model=DownloadUrlResponse)

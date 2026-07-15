@@ -192,6 +192,24 @@ async def publish_job_complete(
 
 # ── Job status ─────────────────────────────────────────────────────────────────
 
+async def get_job_progress(
+    redis: aioredis.Redis, job_id: str
+) -> dict[str, Any] | None:
+    """Return the most recent worker progress event for a job, or None.
+
+    Workers persist their latest progress message under job:progress:{job_id}
+    alongside publishing it on pub/sub, so REST polling and WebSocket snapshots
+    can report chunk-level progress between live events.
+    """
+    key = f"job:progress:{job_id}"
+    try:
+        raw = await redis.get(key)
+        return json.loads(raw) if raw else None
+    except (RedisError, TypeError, ValueError) as exc:
+        log.warning("get_progress_error", job_id=job_id, error=str(exc))
+        return None
+
+
 async def get_job_status(
     redis: aioredis.Redis, job_id: str
 ) -> dict[str, Any] | None:

@@ -66,8 +66,9 @@ def inpaint_chunk(
     loop = asyncio.new_event_loop()
 
     def _report_progress(pct: int) -> None:
+        # Progress events use 1-based chunk numbers (see api/core/progress.py)
         loop.run_until_complete(
-            _publish(job_id, {"stage": "inpainting", "chunk": chunk_index, "total": total_chunks, "pct": pct})
+            _publish(job_id, {"stage": "inpainting", "chunk": chunk_index + 1, "total": total_chunks, "pct": pct})
         )
 
     try:
@@ -112,7 +113,7 @@ def inpaint_chunk(
                 _report_progress(20)
 
                 video_bytes = _run_modal_inpainting(frames_bytes, masks_bytes, fps)
-                _report_progress(80)
+                _report_progress(90)
 
                 with open(output_path, "wb") as f:
                     f.write(video_bytes)
@@ -212,6 +213,9 @@ async def _publish(job_id: str, data: dict) -> None:
     try:
         channel = f"progress:{job_id}"
         message = _json.dumps({"type": "progress", **data})
+        # Persist the latest progress event so REST polling and WebSocket
+        # snapshots can report it (read back via api.core.redis.get_job_progress)
+        await _r.setex(f"job:progress:{job_id}", _s.redis_result_ttl, message)
         await _r.publish(channel, message)
     finally:
         await _r.aclose()

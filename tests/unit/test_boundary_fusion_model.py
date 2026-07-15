@@ -1,4 +1,4 @@
-"""Unit tests for models/boundary_fusion/architecture.py and inference.py.
+"""Unit tests for visionerase_models/boundary_fusion/architecture.py and inference.py.
 
 All tests run on CPU — no GPU required.
 """
@@ -8,13 +8,13 @@ import numpy as np
 import pytest
 import torch
 
-from models.boundary_fusion.architecture import (
+from visionerase_models.boundary_fusion.architecture import (
     BoundaryFusion,
     CrossSegmentAttention,
     LocalWindowAttention,
     PatchEmbedding,
 )
-from models.boundary_fusion.inference import run_boundary_fusion
+from visionerase_models.boundary_fusion.inference import run_boundary_fusion
 
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────

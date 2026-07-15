@@ -59,8 +59,9 @@ def track_masks_chunk(
 
     loop = asyncio.new_event_loop()
     try:
+        # Progress events use 1-based chunk numbers (see api/core/progress.py)
         loop.run_until_complete(
-            _publish(job_id, {"stage": "tracking", "chunk": chunk_index, "total": total_chunks, "pct": 0})
+            _publish(job_id, {"stage": "tracking", "chunk": chunk_index + 1, "total": total_chunks, "pct": 0})
         )
         SEGMENTS_TOTAL.labels(status="chunk_tracking_started").inc()
 
@@ -88,10 +89,6 @@ def track_masks_chunk(
                     f"[{chunk_start_frame}, {chunk_end_frame}) from {segment_s3_key}"
                 )
             bound_log.info("chunk_frames_extracted", num_frames=len(frames))
-
-            loop.run_until_complete(
-                _publish(job_id, {"stage": "tracking", "chunk": chunk_index, "total": total_chunks, "pct": 40})
-            )
 
             # Run XMem++ on Modal T4 GPU
             bound_log.info("xmem_modal_started", chunk_index=chunk_index, num_frames=len(frames))
@@ -122,6 +119,10 @@ def track_masks_chunk(
             bound_log.info("xmem_modal_complete", chunk_index=chunk_index,
                           tracked_shape=str(tracked_array.shape))
 
+            loop.run_until_complete(
+                _publish(job_id, {"stage": "tracking", "chunk": chunk_index + 1, "total": total_chunks, "pct": 60})
+            )
+
             bound_log.info("oiv_refinement_started", num_frames=len(frames))
             tracked_array = refine_tracked_masks(
                 frames=frames,
@@ -142,7 +143,7 @@ def track_masks_chunk(
             s3.upload_file(last_mask_path, settings.s3_bucket, last_mask_key)
 
         loop.run_until_complete(
-            _publish(job_id, {"stage": "tracking", "chunk": chunk_index, "total": total_chunks, "pct": 100})
+            _publish(job_id, {"stage": "tracking", "chunk": chunk_index + 1, "total": total_chunks, "pct": 100})
         )
         SEGMENTS_TOTAL.labels(status="chunk_tracking_complete").inc()
 
@@ -232,6 +233,9 @@ async def _publish(job_id: str, data: dict) -> None:
     try:
         channel = f"progress:{job_id}"
         message = _json.dumps({"type": "progress", **data})
+        # Persist the latest progress event so REST polling and WebSocket
+        # snapshots can report it (read back via api.core.redis.get_job_progress)
+        await _r.setex(f"job:progress:{job_id}", _s.redis_result_ttl, message)
         await _r.publish(channel, message)
     finally:
         await _r.aclose()

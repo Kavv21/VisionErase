@@ -9,7 +9,8 @@ import GlassCard from '../components/GlassCard'
 
 // Message shapes the /ws/{job_id} endpoint actually emits (see api/routers/websocket.py)
 // chunk/total are present once the pipeline splits a long video into chunks
-// (see workers/segmentation/chunk_tasks.py, workers/inpainting/chunk_tasks.py)
+// (see workers/segmentation/chunk_tasks.py, workers/inpainting/chunk_tasks.py).
+// chunk is 1-based.
 type WsMsg =
   | { type: 'progress'; stage: string; pct: number; chunk?: number; total?: number }
   | { type: 'complete'; result: { result_s3_key: string | null } }
@@ -19,19 +20,56 @@ type WsMsg =
 
 const STAGE_LABELS: Record<string, string> = {
   pending: 'Waiting to start',
-  segmenting: 'Segmenting',
-  tracking: 'Tracking',
-  inpainting: 'Inpainting',
-  stitching: 'Stitching',
+  segmenting: 'SAM2 Object Mask Generated',
+  tracking: 'XMem++ Tracking Mask Across Frames',
+  oiv: 'OIV Embedding — Verifying Object Identity',
+  inpainting: 'ProPainter — Filling Removed Region',
+  stitching: 'Stitching Final Video',
+  boundary_fusion: 'BoundaryFusion — Cleaning Edges',
+  quality: 'Quality Check',
   quality_check: 'Quality Check',
-  completed: 'Complete',
+  completed: 'Processing Complete',
   failed: 'Failed',
 }
 
-// Backend stage progression, used only to derive which display stage is active/complete.
-const BACKEND_ORDER = ['pending', 'segmenting', 'tracking', 'inpainting', 'stitching', 'quality_check', 'completed']
+// Map a worker progress event to an overall 0-100 job percentage.
+// Stage budget: segmenting 0-5, tracking 5-45, inpainting 45-80,
+// stitching 83, boundary_fusion 90, quality 96, completed 100.
+// Must stay in sync with api/core/progress.py (compute_overall_pct).
+const computeOverallPct = (msg: { stage?: string; pct?: number; chunk?: number; total?: number }): number => {
+  const stage = msg.stage || ''
+  // chunk is 1-based; messages without chunk info span the whole stage
+  const chunk = msg.chunk || 1
+  const total = msg.total || 1
+  const pct = msg.pct || 0
 
-const PIPELINE_STAGES: { title: string; backendIdx: number; icon: ReactElement }[] = [
+  if (stage === 'segmenting' || stage === 'segmentation') return 5
+
+  if (stage === 'tracking') {
+    // Each chunk is 1/total of the 40% tracking phase
+    const chunkFraction = (chunk - 1 + pct / 100) / total
+    return Math.min(45, Math.max(5, Math.round(5 + chunkFraction * 40))) // 5-45%
+  }
+
+  if (stage === 'inpainting') {
+    const chunkFraction = (chunk - 1 + pct / 100) / total
+    return Math.min(80, Math.max(45, Math.round(45 + chunkFraction * 35))) // 45-80%
+  }
+
+  if (stage === 'stitching') return 83
+  if (stage === 'boundary_fusion') return 90
+  if (stage === 'quality' || stage === 'quality_check') return 96
+  if (stage === 'completed') return 100
+
+  // Fallback: use pct directly if available
+  return pct || 0
+}
+
+// Backend stage progression, used only to derive which display stage is active/complete.
+const BACKEND_ORDER = ['pending', 'segmenting', 'tracking', 'inpainting', 'stitching', 'boundary_fusion', 'quality_check', 'completed']
+
+// stageKey marks the card that shows "chunk X of Y" while that stage is active.
+const PIPELINE_STAGES: { title: string; backendIdx: number; stageKey?: string; icon: ReactElement }[] = [
   {
     title: 'Uploading Video',
     backendIdx: 0,
@@ -53,6 +91,7 @@ const PIPELINE_STAGES: { title: string; backendIdx: number; icon: ReactElement }
   {
     title: 'XMem++ Tracking Mask Across Frames',
     backendIdx: 2,
+    stageKey: 'tracking',
     icon: (
       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
@@ -69,17 +108,9 @@ const PIPELINE_STAGES: { title: string; backendIdx: number; icon: ReactElement }
     ),
   },
   {
-    title: 'Boundary Fusion — Cleaning Edges',
-    backendIdx: 4,
-    icon: (
-      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-      </svg>
-    ),
-  },
-  {
     title: 'ProPainter — Filling Removed Region',
     backendIdx: 3,
+    stageKey: 'inpainting',
     icon: (
       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -87,11 +118,29 @@ const PIPELINE_STAGES: { title: string; backendIdx: number; icon: ReactElement }
     ),
   },
   {
-    title: 'Rendering Final Video',
-    backendIdx: 5,
+    title: 'Stitching Final Video',
+    backendIdx: 4,
     icon: (
       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+      </svg>
+    ),
+  },
+  {
+    title: 'BoundaryFusion — Cleaning Edges',
+    backendIdx: 5,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+      </svg>
+    ),
+  },
+  {
+    title: 'Quality Check',
+    backendIdx: 6,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
       </svg>
     ),
   },
@@ -118,7 +167,7 @@ export default function JobProgress() {
 
   const [connState, setConnState] = useState<ConnectionState>('connecting')
   const [stage, setStage] = useState('pending')
-  const [pct, setPct] = useState(0)
+  const [overallPct, setOverallPct] = useState(0)
   const [chunkInfo, setChunkInfo] = useState<{ chunk: number; total: number } | null>(null)
   const [isDone, setIsDone] = useState(false)
   const [resultKey, setResultKey] = useState<string | null>(null)
@@ -138,6 +187,19 @@ export default function JobProgress() {
 
     const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? 'http://localhost:8000'
     const wsBase = apiBase.replace(/^http/, 'ws')
+
+    // Overall progress is monotone: parallel chunk workers can emit events out
+    // of order (e.g. tracking chunk 3 after inpainting chunk 1 started), so
+    // never let the ring move backwards.
+    const applyProgress = (msg: { stage?: string; pct?: number; chunk?: number; total?: number }) => {
+      setStage(msg.stage ?? 'pending')
+      setChunkInfo(
+        typeof msg.chunk === 'number' && typeof msg.total === 'number'
+          ? { chunk: msg.chunk, total: msg.total }
+          : null
+      )
+      setOverallPct((prev) => Math.max(prev, computeOverallPct(msg)))
+    }
 
     function connect(isReconnect: boolean) {
       if (isReconnect) {
@@ -163,16 +225,10 @@ export default function JobProgress() {
 
         if ('type' in msg) {
           if (msg.type === 'progress') {
-            setStage(msg.stage ?? 'pending')
-            setPct(typeof msg.pct === 'number' ? msg.pct : 0)
-            setChunkInfo(
-              typeof msg.chunk === 'number' && typeof msg.total === 'number'
-                ? { chunk: msg.chunk, total: msg.total }
-                : null
-            )
+            applyProgress(msg)
           } else if (msg.type === 'complete') {
             setStage('completed')
-            setPct(100)
+            setOverallPct(100)
             setChunkInfo(null)
             setResultKey(msg.result?.result_s3_key ?? null)
             setIsDone(true)
@@ -184,13 +240,7 @@ export default function JobProgress() {
           }
         } else if ('stage' in msg) {
           // pub/sub forwarded worker event
-          setStage(msg.stage ?? 'pending')
-          setPct(typeof msg.pct === 'number' ? msg.pct : 0)
-          setChunkInfo(
-            typeof msg.chunk === 'number' && typeof msg.total === 'number'
-              ? { chunk: msg.chunk, total: msg.total }
-              : null
-          )
+          applyProgress(msg)
         }
       })
 
@@ -228,17 +278,22 @@ export default function JobProgress() {
         const data = await apiGetJob(jobId)
         if (data.status === 'completed') {
           setStage('completed')
-          setPct(100)
+          setOverallPct(100)
           setResultKey(data.result_s3_key ?? null)
           setIsDone(true)
         } else if (data.status === 'failed') {
           setWsError(data.error ?? 'An error occurred')
           setIsDone(true)
         } else {
-          setStage(data.status)
-          setPct(data.progress_pct)
-          // REST status has no chunk granularity — drop any stale chunk label
-          setChunkInfo(null)
+          // REST progress_pct is already the overall percentage
+          // (computed server-side from the latest worker progress event).
+          setOverallPct((prev) => Math.max(prev, data.progress_pct))
+          setStage((prev) => {
+            // REST status has no chunk granularity — only drop the chunk
+            // label when the stage actually moved on.
+            if (prev !== data.status) setChunkInfo(null)
+            return data.status
+          })
         }
       } catch {
         // transient polling error — the next tick will retry
@@ -256,17 +311,11 @@ export default function JobProgress() {
     }
   }, [isDone, wsError, jobId, navigate])
 
-  // Chunk-aware label, e.g. "Tracking chunk 2 of 5" once the pipeline has
-  // split the video into chunks (see workers/*/chunk_tasks.py).
+  // Chunk-aware label, e.g. "XMem++ Tracking Mask Across Frames — chunk 2 of 5"
+  // once the pipeline has split the video into chunks (chunk is 1-based).
   const stageLabel = chunkInfo
-    ? `${STAGE_LABELS[stage] ?? stage} — chunk ${chunkInfo.chunk + 1} of ${chunkInfo.total}`
+    ? `${STAGE_LABELS[stage] ?? stage} — chunk ${chunkInfo.chunk} of ${chunkInfo.total}`
     : STAGE_LABELS[stage] ?? stage
-
-  // Overall progress across all chunks: completed chunks + current chunk's
-  // own pct, out of the total chunk count.
-  const displayPct = chunkInfo
-    ? Math.round(((chunkInfo.chunk + pct / 100) / chunkInfo.total) * 100)
-    : pct
 
   // Purely visual: append a timestamped line to the processing log whenever
   // the displayed stage (or chunk within a stage) changes. Does not affect
@@ -311,8 +360,9 @@ export default function JobProgress() {
             </p>
           </GlassCard>
         ) : (
-          <div className="flex justify-center mb-8">
-            <ProgressRing percent={displayPct} />
+          <div className="flex flex-col items-center mb-8">
+            <ProgressRing percent={overallPct} />
+            <p className="mt-4 text-sm text-[#A0A0B0]">{stageLabel}</p>
           </div>
         )}
 
@@ -361,6 +411,11 @@ export default function JobProgress() {
               title={s.title}
               icon={s.icon}
               status={stageStatus(i, s.backendIdx, currentIdx, !!wsError)}
+              subtitle={
+                s.stageKey === stage && chunkInfo
+                  ? `chunk ${chunkInfo.chunk} of ${chunkInfo.total}`
+                  : undefined
+              }
             />
           ))}
         </div>

@@ -8,6 +8,7 @@ interface StageCardProps {
   title: string
   status: StageStatus
   index: number
+  subtitle?: string
 }
 
 const STATUS_STYLES: Record<StageStatus, string> = {
@@ -34,7 +35,7 @@ function StatusIndicator({ status }: { status: StageStatus }) {
   return <span className="w-2.5 h-2.5 rounded-full bg-white/15" />
 }
 
-export default function StageCard({ icon, title, status, index }: StageCardProps) {
+export default function StageCard({ icon, title, status, index, subtitle }: StageCardProps) {
   return (
     <motion.div
       initial={{ opacity: 0, x: -12 }}
@@ -52,7 +53,10 @@ export default function StageCard({ icon, title, status, index }: StageCardProps
       <div className="relative shrink-0 w-9 h-9 rounded-xl bg-white/5 flex items-center justify-center">
         {icon}
       </div>
-      <span className="relative flex-1 font-semibold text-sm">{title}</span>
+      <span className="relative flex-1 font-semibold text-sm">
+        {title}
+        {subtitle && <span className="ml-2 font-normal text-xs text-[#A0A0B0]">{subtitle}</span>}
+      </span>
       <div className="relative shrink-0">
         <StatusIndicator status={status} />
       </div>
