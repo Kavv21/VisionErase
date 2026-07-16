@@ -33,6 +33,7 @@ from botocore.exceptions import ClientError
 from httpx import ASGITransport, AsyncClient
 from starlette.testclient import TestClient
 
+from api.core import database as database_module
 from api.core import redis as redis_module
 from api.core.auth import get_current_user
 from api.core.config import get_settings
@@ -99,6 +100,9 @@ async def client() -> AsyncClient:
             yield ac
     finally:
         await redis_module.close_redis_pool()
+        # create_job writes to Postgres; dispose the engine on this test's event
+        # loop so no pooled asyncpg connection leaks into the next test's loop.
+        await database_module.engine.dispose()
         app.dependency_overrides.pop(get_current_user, None)
 
 

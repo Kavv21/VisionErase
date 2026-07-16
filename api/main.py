@@ -10,8 +10,9 @@ from api.core import database as database_module
 from api.core import redis as redis_module
 from api.core.config import get_settings
 from api.middleware.rate_limiter import RateLimitMiddleware
+from api.models import job_record as _job_record_models  # noqa: F401 — registers ORM model with Base.metadata
 from api.models import user as _user_models  # noqa: F401 — registers ORM model with Base.metadata
-from api.routers import auth, health, jobs, segment, websocket
+from api.routers import admin, auth, health, jobs, segment, websocket
 
 log = structlog.get_logger(__name__)
 settings = get_settings()
@@ -57,6 +58,7 @@ app.mount("/metrics", make_asgi_app())
 
 # ── Routers ────────────────────────────────────────────────────────────────────
 
+app.include_router(admin.router, prefix="/api/v1/admin")
 app.include_router(auth.router, prefix="/api/v1/auth")
 app.include_router(jobs.router, prefix="/api/v1/jobs")
 app.include_router(segment.router, prefix="/api/v1/segment")

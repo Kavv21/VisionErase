@@ -135,3 +135,26 @@ DOWNLOAD_URL_REQUESTS_TOTAL = Counter(
     "visionerase_download_url_requests_total",
     "Total presigned result download URL requests",
 )
+
+ADMIN_JOBS_REQUESTS_TOTAL = Counter(
+    "visionerase_admin_jobs_requests_total",
+    "Total GET /api/v1/admin/jobs requests",
+)
+
+QUALITY_SSIM_SCORE = Histogram(
+    "visionerase_quality_ssim_score",
+    "Mean SSIM between input and result video frames",
+    buckets=[0.3, 0.5, 0.65, 0.75, 0.85, 0.9, 0.95, 1.0],
+)
+
+QUALITY_PSNR_DB = Histogram(
+    "visionerase_quality_psnr_db",
+    "Mean PSNR (dB) between input and result video frames",
+    buckets=[10, 15, 20, 25, 30, 35, 40, 50],
+)
+
+QUALITY_TEMPORAL_CONSISTENCY = Histogram(
+    "visionerase_quality_temporal_consistency",
+    "Mean cosine similarity between consecutive result frames",
+    buckets=[0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 1.0],
+)

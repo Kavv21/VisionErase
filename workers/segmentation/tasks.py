@@ -50,6 +50,9 @@ def segment_first_frame(
     )
     bound_log.info("segmentation_started")
 
+    from workers.db import mark_job_processing
+    mark_job_processing(job_id)
+
     points = mask_data.get("points") or []
     frame_index = mask_data.get("frame_index", 0)
 
@@ -110,6 +113,9 @@ def segment_first_frame(
                 chunk_size=CHUNK_SIZE,
             )
             SEGMENTS_TOTAL.labels(status="chunking_dispatched").inc()
+
+            from workers.db import set_job_total_chunks
+            set_job_total_chunks(job_id, total_chunks)
 
             from workers.segmentation.chunk_tasks import track_masks_chunk
             for chunk_index, (start_frame, end_frame) in enumerate(chunks):

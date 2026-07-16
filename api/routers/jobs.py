@@ -8,9 +8,11 @@ from typing import Annotated
 import structlog
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.core.auth import get_current_user
 from api.core.config import get_settings
+from api.core.database import get_db
 from api.core.metrics import (
     DOWNLOAD_URL_REQUESTS_TOTAL,
     JOB_STATUS_REQUESTS_TOTAL,
@@ -38,6 +40,7 @@ from api.models.job import (
     UploadURLResponse,
     VideoUploadResponse,
 )
+from api.models.job_record import JobRecord
 from api.models.user import User
 from api.services.storage import _PRESIGNED_EXPIRES_IN, _s3_client, generate_download_url, generate_upload_url
 from workers.segmentation.tasks import segment_first_frame
@@ -47,6 +50,7 @@ router = APIRouter(tags=["jobs"])
 
 RedisDep = Annotated[Redis, Depends(get_redis)]
 AuthDep = Annotated[User, Depends(get_current_user)]
+DbDep = Annotated[AsyncSession, Depends(get_db)]
 
 # ZPOPMAX dequeues highest score first.  Invert the IntEnum (URGENT=0 → score=3).
 _MAX_PRIORITY_SCORE = int(JobPriority.BATCH)
@@ -60,6 +64,7 @@ async def create_job(
     redis: RedisDep,
     response: Response,
     _current_user: AuthDep,
+    db: DbDep,
 ) -> JobResponse:
     """Submit a job; returns 200 + cached=True on dedup hit, 202 on new enqueue."""
     mask_dict = req.mask.model_dump()
@@ -95,6 +100,22 @@ async def create_job(
             "error": None,
         },
     )
+
+    # Persist the job row; DB is bookkeeping, so a failure must not block the job.
+    try:
+        db.add(
+            JobRecord(
+                id=uuid.UUID(job_id),
+                user_id=_current_user.id,
+                status="pending",
+                video_s3_key=req.video_s3_key,
+                priority=req.priority.name,
+            )
+        )
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        bound_log.error("job_db_insert_failed", error=str(exc))
 
     payload = {
         "job_id": job_id,

@@ -55,7 +55,7 @@ celery_app.autodiscover_tasks(
 
 # ── Worker startup signal ──────────────────────────────────────────────────────
 
-from celery.signals import worker_process_init
+from celery.signals import task_failure, worker_process_init
 
 @worker_process_init.connect
 def init_worker_redis(**kwargs):
@@ -63,6 +63,25 @@ def init_worker_redis(**kwargs):
     from api.core.redis import init_redis_pool
     init_redis_pool()
     log.info("worker_redis_pool_initialized")
+
+
+@task_failure.connect
+def mark_job_failed_in_db(sender=None, args=None, kwargs=None, exception=None, **_):
+    """Persist failure to the jobs table for any pipeline task.
+
+    Every VisionErase task takes job_id as its first positional argument, so a
+    single global hook covers all workers without touching each except block.
+    """
+    job_id = (args[0] if args else None) or (kwargs or {}).get("job_id")
+    if not job_id:
+        return
+    from workers.db import mark_job_failed
+    mark_job_failed(str(job_id), str(exception))
+    log.info(
+        "job_marked_failed_in_db",
+        job_id=str(job_id),
+        task=getattr(sender, "name", None),
+    )
 
 
 
