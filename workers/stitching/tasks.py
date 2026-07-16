@@ -145,10 +145,11 @@ def stitch_all_chunks(
         )
         SEGMENTS_TOTAL.labels(status="chunk_stitching_complete").inc()
 
-        from workers.boundary.tasks import apply_boundary_fusion
-        apply_boundary_fusion.apply_async(
+        # BoundaryFusion temporarily bypassed — needs retraining at higher resolution
+        from workers.quality.tasks import quality_check_final
+        quality_check_final.apply_async(
             args=[job_id, result_s3_key],
-            queue="boundary",
+            queue="quality",
         )
 
         return {

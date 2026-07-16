@@ -64,7 +64,14 @@ def run_boundary_fusion(
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
-    combined = np.concatenate([frames_a, frames_b], axis=0)  # (20, H, W, 3)
+    import cv2 as _cv2
+    # BoundaryFusion trained at 128x128 — resize for inference, restore after
+    orig_h, orig_w = frames_a.shape[1], frames_a.shape[2]
+    MODEL_SIZE = 128  # must match training img_size
+    if orig_h != MODEL_SIZE or orig_w != MODEL_SIZE:
+        frames_a = np.stack([_cv2.resize(f, (MODEL_SIZE, MODEL_SIZE)) for f in frames_a])
+        frames_b = np.stack([_cv2.resize(f, (MODEL_SIZE, MODEL_SIZE)) for f in frames_b])
+    combined = np.concatenate([frames_a, frames_b], axis=0)  # (20, MODEL_SIZE, MODEL_SIZE, 3)
     tensor = torch.from_numpy(combined.astype(np.float32) / 255.0).to(device=device, dtype=dtype)
 
     log.debug(
@@ -78,6 +85,11 @@ def run_boundary_fusion(
         output = model(tensor)                      # (20, H, W, 3) float32 in [0, 1]
 
     result = (output.float().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    # Resize back to original resolution
+    if orig_h != MODEL_SIZE or orig_w != MODEL_SIZE:
+        result = np.stack([
+            _cv2.resize(f, (orig_w, orig_h)) for f in result
+        ])
     log.debug("boundary_fusion_inference_done", output_shape=list(result.shape))
     return result
 
