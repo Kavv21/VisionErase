@@ -68,6 +68,19 @@ def track_masks(
 
     T = len(frames)
     H, W = frames[0].shape[:2]
+    # Resize to 480p for faster tracking
+    MAX_W, MAX_H = 854, 480
+    out_size = (W, H)
+    if W > MAX_W or H > MAX_H:
+        scale = min(MAX_W/W, MAX_H/H)
+        W_new = (int(W*scale)//8)*8
+        H_new = (int(H*scale)//8)*8
+        frames = [cv2.resize(f, (W_new, H_new)) for f in frames]
+        seed_mask_binary = cv2.resize(
+            seed_mask_binary, (W_new, H_new),
+            interpolation=cv2.INTER_NEAREST
+        )
+        W, H = W_new, H_new
     print(f"Tracking {T} frames at {W}x{H} on {torch.cuda.get_device_name(0)}")
     print(f"Seed mask coverage: {seed_mask_binary.mean()*100:.1f}%")
 

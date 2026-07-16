@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 log = structlog.get_logger(__name__)
 
-OIV_THRESHOLD = 0.3
+OIV_THRESHOLD = 0.2  # lowered from 0.3 — less aggressive rejection
 CROP_PADDING_FRAC = 0.2
 INPUT_SIZE = (256, 256)
 NORM_MEAN = [0.485, 0.456, 0.406]

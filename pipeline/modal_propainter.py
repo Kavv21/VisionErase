@@ -102,7 +102,7 @@ def inpaint_frames(frames_bytes, masks_bytes, fps=24.0):
     out_size = (W, H)
 
     # Cap resolution
-    MAX_W, MAX_H = 640, 360  # conservative for 60 frames on A10G
+    MAX_W, MAX_H = 854, 480  # A10G 24GB can handle this resolution
     scale    = min(MAX_W / W, MAX_H / H, 1.0)
     W_new = (int(W * scale) // 8) * 8
     H_new = (int(H * scale) // 8) * 8

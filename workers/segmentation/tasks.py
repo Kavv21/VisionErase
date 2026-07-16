@@ -20,7 +20,7 @@ MAX_TRACKING_FRAMES = 60    # process 60 frames per chunk to avoid RAM OOM
 TRACKING_WIDTH      = 854   # resize to 480p
 TRACKING_HEIGHT     = 480
 
-CHUNK_SIZE = 60  # frames per chunk when splitting a full video for chunked tracking
+CHUNK_SIZE = 30  # smaller chunks = better temporal consistency  # frames per chunk when splitting a full video for chunked tracking
 
 
 # Import celery_app lazily to avoid circular imports at module load time.
