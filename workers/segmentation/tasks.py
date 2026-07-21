@@ -136,7 +136,7 @@ def segment_first_frame(
                 first_frame_mask=mask_array,
                 model_cache_dir=settings.model_cache_dir,
                 device=settings.device,
-                on_progress=_tracking_progress,
+                # on_progress removed — subprocess wrapper handles progress
             )
             # Trust the decoded frame count over container metadata so chunk
             # ranges always line up with the mask array.

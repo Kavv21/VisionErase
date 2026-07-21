@@ -30,7 +30,143 @@ TINY_MASK_COVERAGE_PCT = 0.05
 JPEG_QUALITY = 95
 
 
+# Executed in a fresh interpreter (sys.argv[1] = input pickle, sys.argv[2] =
+# output .npy). Celery's prefork workers cannot re-initialize CUDA ("Cannot
+# re-initialize CUDA in forked subprocess"), which silently drops SAM2 VP to
+# CPU at ~25x the per-frame cost — a clean process initializes CUDA normally.
+# The CUDA availability check must happen here, in the fresh process, not in
+# the forked parent where it can misreport.
+_RUNNER_SCRIPT = """\
+import sys
+
+sys.path.insert(0, "/home/kavish/visionerase")
+sys.path.insert(0, "/home/kavish/sam2")
+sys.path.insert(0, "/home/kavish/XMem")
+sys.path.insert(0, "/home/kavish/ProPainter")
+
+import pickle
+
+import numpy as np
+import torch
+
+with open(sys.argv[1], "rb") as f:
+    kwargs = pickle.load(f)
+
+# Authoritative device decision: this is a fresh process, so the check is
+# trustworthy here (unlike in the forked Celery parent, which can misreport
+# in either direction). The requested value is ignored on purpose — always
+# use CUDA when this process can see it.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+from workers.segmentation.sam2_video_tracker import _track
+
+result = _track(
+    video_path=kwargs["video_path"],
+    first_frame_mask=kwargs["first_frame_mask"],
+    model_cache_dir=kwargs["model_cache_dir"],
+    device=device,
+    on_progress=None,
+)
+np.save(sys.argv[2], result)
+"""
+
+SUBPROCESS_TIMEOUT_SEC = 600
+
+
 def track_with_sam2_video_predictor(
+    video_path: str,
+    first_frame_mask,
+    model_cache_dir: str,
+    device: str = "cuda",
+    on_progress: Callable[[int], None] | None = None,
+) -> "np.ndarray":
+    """Run _track() in a fresh subprocess so CUDA can initialize.
+
+    The caller's device argument (settings.device, "cpu" in .env) is
+    overridden: CUDA is always requested when available, and the subprocess
+    re-checks in its own fresh process, which is the only trustworthy place.
+    on_progress is accepted for signature compatibility but not forwarded —
+    callables can't cross the process boundary. Per-frame progress appears
+    only in the relayed subprocess logs.
+    """
+    import pickle
+    import subprocess
+    import sys
+
+    import torch as _torch
+
+    _forced_device = "cuda" if _torch.cuda.is_available() else "cpu"
+
+    started = time.perf_counter()
+    # Private per-call dir so concurrent workers never race on a shared
+    # script/pickle path in /tmp.
+    work_dir = tempfile.mkdtemp(prefix="sam2vp_sub_")
+    runner_path = os.path.join(work_dir, "runner.py")
+    input_path = os.path.join(work_dir, "input.pkl")
+    output_path = os.path.join(work_dir, "tracked.npy")
+    try:
+        with open(runner_path, "w") as f:
+            f.write(_RUNNER_SCRIPT)
+        with open(input_path, "wb") as f:
+            pickle.dump(
+                {
+                    "video_path": video_path,
+                    "first_frame_mask": np.asarray(first_frame_mask),
+                    "model_cache_dir": model_cache_dir,
+                    "device": _forced_device,
+                },
+                f,
+            )
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = (
+            "/home/kavish/visionerase:"
+            "/home/kavish/sam2:"
+            "/home/kavish/XMem:"
+            "/home/kavish/ProPainter:"
+            + env.get("PYTHONPATH", "")
+        )
+
+        log.info(
+            "sam2_vp_subprocess_started",
+            video_path=video_path,
+            device=_forced_device,
+            requested_device=device,
+        )
+        result = subprocess.run(
+            [sys.executable, runner_path, input_path, output_path],
+            env=env,
+            timeout=SUBPROCESS_TIMEOUT_SEC,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"SAM2 VP subprocess failed (rc={result.returncode}):\n"
+                f"{result.stderr[-2000:]}"
+            )
+
+        tracked = np.load(output_path)
+        # Relay the subprocess's own structlog output (device, sec/frame,
+        # VRAM) — capture_output would otherwise swallow it entirely. tqdm
+        # progress bars are dropped so they don't crowd out the real lines.
+        sub_logs = "\n".join(
+            line
+            for line in (result.stdout + result.stderr).splitlines()
+            if line.strip() and "it/s" not in line
+        )
+        log.info(
+            "sam2_vp_subprocess_complete",
+            num_frames=len(tracked),
+            elapsed_sec=round(time.perf_counter() - started, 2),
+            subprocess_logs=sub_logs[-2000:],
+        )
+        return tracked
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _track(
     video_path: str,
     first_frame_mask: np.ndarray,
     model_cache_dir: str,
