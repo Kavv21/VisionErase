@@ -161,6 +161,20 @@ class ModelPool:
 
         return entry
 
+    def evict(self, name: str) -> None:
+        """Explicitly evict a named model from the pool."""
+        with self._lock:
+            if name in self._pool:
+                entry = self._pool.pop(name)
+                try:
+                    entry.model.to("cpu")
+                except Exception:
+                    pass
+                del entry
+                _empty_cuda_cache()
+                log.info("model_evicted_explicit", model=name)
+                MODEL_POOL_SIZE.dec()
+
     def _evict_lru(self, needed_gb: float) -> None:
         """Pop LRU models until the pool has room for needed_gb.
 

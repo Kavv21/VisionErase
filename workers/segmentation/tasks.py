@@ -101,6 +101,16 @@ def segment_first_frame(
             )
             SEGMENTS_TOTAL.labels(status=f"segmentation_{status}").inc()
 
+            # Evict SAM2 image predictor from GPU before SAM2 VP tracking
+            try:
+                from pipeline.pool.model_pool import get_model_pool
+                get_model_pool().evict("sam2")
+                import torch as _torch
+                _torch.cuda.empty_cache()
+                bound_log.info("sam2_image_predictor_evicted")
+            except Exception as _e:
+                bound_log.warning("sam2_evict_failed", error=str(_e))
+
             # Track ALL frames in one pass with SAM2 Video Predictor on the
             # local GPU — replaces the sequential per-chunk XMem++ Modal calls.
             from workers.segmentation.sam2_video_tracker import (

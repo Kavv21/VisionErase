@@ -18,7 +18,7 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-SAM2_REPO_PATH = "/home/kavish/sam2"
+SAM2_PATH = "/home/kavish/sam2"
 SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_s.yaml"
 SAM2_CHECKPOINT_FILE = "sam2_hiera_small.pt"
 
@@ -47,10 +47,18 @@ def track_with_sam2_video_predictor(
 
     try:
         return _track(video_path, first_frame_mask, model_cache_dir, device, on_progress)
-    except torch.cuda.OutOfMemoryError:
+    except torch.cuda.OutOfMemoryError as exc:
         if device == "cpu":
             raise
-        log.warning("sam2_vp_fallback_cpu", video_path=video_path)
+        # CPU tracking is ~25x slower (3-4s/frame vs 0.15s/frame) — if this
+        # fires, tracking still succeeds but the speed win is gone. Loud log
+        # so a "0% GPU utilization" run is diagnosable from the worker logs.
+        log.warning(
+            "sam2_vp_fallback_cpu",
+            video_path=video_path,
+            oom_error=str(exc),
+            vram_allocated_gb=round(torch.cuda.memory_allocated() / 1e9, 2),
+        )
         torch.cuda.empty_cache()
         return _track(video_path, first_frame_mask, model_cache_dir, "cpu", on_progress)
 
@@ -66,8 +74,8 @@ def _track(
     import sys
     import torch
 
-    if SAM2_REPO_PATH not in sys.path:
-        sys.path.insert(0, SAM2_REPO_PATH)
+    if SAM2_PATH not in sys.path:
+        sys.path.insert(0, SAM2_PATH)
     from sam2.build_sam import build_sam2_video_predictor
 
     started = time.perf_counter()
@@ -107,14 +115,32 @@ def _track(
     # Loaded directly (not via the model pool): segmentation and tracking run
     # strictly sequentially in this worker and VP is freed right after use, so
     # the pool's LRU/VRAM management would only get in the way here.
-    predictor = build_sam2_video_predictor(
-        SAM2_CONFIG,
-        os.path.join(model_cache_dir, SAM2_CHECKPOINT_FILE),
-        device=device,
-    )
+    # Must run from sam2 directory for hydra config resolution
+    _orig_dir = os.getcwd()
+    os.chdir(SAM2_PATH)
+    try:
+        predictor = build_sam2_video_predictor(
+            SAM2_CONFIG,
+            os.path.join(model_cache_dir, SAM2_CHECKPOINT_FILE),
+            device=device,
+        )
+    finally:
+        os.chdir(_orig_dir)  # restore working directory
+
+    # Verify the weights actually landed on the requested device — a CPU
+    # predictor here means every propagation step silently runs ~25x slower.
+    for name, param in list(predictor.named_parameters())[:2]:
+        log.info("param_device", name=name, device=str(param.device))
+    device_check = next(predictor.parameters()).device
+    if device == "cuda" and device_check.type != "cuda":
+        log.warning("predictor_on_cpu_moving_to_cuda")
+        predictor = predictor.to("cuda")
+        device_check = next(predictor.parameters()).device
+
     log.info(
         "sam2_vp_model_loaded",
         device=device,
+        param_device=str(device_check),
         proc_size=f"{out_w}x{out_h}",
         seed_coverage_pct=round(coverage_pct, 2),
     )
@@ -193,6 +219,11 @@ def _track(
         elapsed_sec=round(elapsed, 2),
         num_segments=len(segments),
         device=device,
+        peak_vram_gb=(
+            round(torch.cuda.max_memory_allocated() / 1e9, 2)
+            if torch.cuda.is_available()
+            else None
+        ),
     )
     return result
 
@@ -226,8 +257,9 @@ def _track_segment(
         # 300 frames at 1024px), an instant OOM on the 4GB RTX 3050.
         state = predictor.init_state(
             video_path=frames_dir,
-            offload_video_to_cpu=on_cuda,
-            offload_state_to_cpu=on_cuda,
+            offload_video_to_cpu=True,   # keep frames in CPU RAM
+            offload_state_to_cpu=False,  # keep state on GPU for fast compute
+            async_loading_frames=False,
         )
         try:
             if use_points:
@@ -249,14 +281,36 @@ def _track_segment(
 
             num_frames = state["num_frames"]
             tracked: dict[int, np.ndarray] = {}
+            if on_cuda:
+                torch.cuda.synchronize()
+            prop_started = time.perf_counter()
             for frame_idx, _obj_ids, masks in predictor.propagate_in_video(state):
                 mask = np.squeeze((masks[0] > 0.5).cpu().numpy()).astype(np.uint8) * 255
                 tracked[frame_idx] = mask
+                if len(tracked) == 5:
+                    # Early GPU-activity probe: on CUDA this should read
+                    # ~0.15s/frame; ~3-4s/frame means compute fell to CPU.
+                    if on_cuda:
+                        torch.cuda.synchronize()
+                    log.info(
+                        "sam2_vp_propagation_speed",
+                        sec_per_frame=round((time.perf_counter() - prop_started) / 5, 3),
+                        device="cuda" if on_cuda else "cpu",
+                    )
                 if on_progress and frame_idx % 30 == 0 and total_hint > 0:
                     pct = int((frames_before + frame_idx + 1) / total_hint * 100)
                     on_progress(min(pct, 99))
         finally:
             predictor.reset_state(state)
+
+    elapsed = time.perf_counter() - prop_started
+    log.info(
+        "sam2_vp_segment_tracked",
+        num_frames=num_frames,
+        sec_per_frame=round(elapsed / max(num_frames, 1), 3),
+        elapsed_sec=round(elapsed, 2),
+        device="cuda" if on_cuda else "cpu",
+    )
 
     template = next(iter(tracked.values()))
     return np.stack(
