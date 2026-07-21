@@ -1,3 +1,6 @@
+# DEPRECATED: XMem++ chunk tracking replaced by SAM2 Video Predictor
+# (sam2_video_tracker.py), which tracks the whole video in one pass. This
+# module is no longer autodiscovered or dispatched. Kept for reference only.
 from __future__ import annotations
 
 import asyncio

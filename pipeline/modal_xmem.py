@@ -1,3 +1,5 @@
+# DEPRECATED: XMem++ replaced by SAM2 Video Predictor
+# (workers/segmentation/sam2_video_tracker.py). Kept for reference only.
 """
 Modal.com serverless XMem++ mask tracking.
 Runs on T4 GPU (16GB VRAM) — no local VRAM needed.
@@ -58,6 +60,7 @@ def track_masks(
     from PIL import Image
 
     sys.path.insert(0, "/XMem")
+    import cv2
     device = torch.device("cuda")
 
     # Decode frames

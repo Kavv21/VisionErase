@@ -45,11 +45,14 @@ def inpaint_chunk(
     chunk_index: int,
     total_chunks: int,
     segment_s3_key: str,
-    tracked_masks_s3_key: str,
+    masks_s3_key: str,
     chunk_start_frame: int,
     chunk_end_frame: int,
 ) -> dict[str, Any]:
     """Inpaint one chunk of frames with ProPainter, guided by its tracked masks.
+
+    masks_s3_key points at the full-video (T, H, W) mask array produced by
+    SAM2 Video Predictor; this task slices out its own frame range.
 
     Once every chunk's inpainting has completed (tracked via an atomic Redis
     counter), triggers stitch_all_chunks to assemble the final video.
@@ -81,9 +84,10 @@ def inpaint_chunk(
             video_path = os.path.join(tmp, "video.mp4")
             masks_path = os.path.join(tmp, "tracked_masks.npy")
             s3.download_file(settings.s3_bucket, segment_s3_key, video_path)
-            s3.download_file(settings.s3_bucket, tracked_masks_s3_key, masks_path)
+            s3.download_file(settings.s3_bucket, masks_s3_key, masks_path)
 
-            masks = np.load(masks_path)  # (T, H, W) uint8, values 0 or 255
+            all_masks = np.load(masks_path)  # (T, H, W) uint8 full-video masks
+            masks = all_masks[chunk_start_frame:chunk_end_frame]
             width, height = _read_resolution(video_path)
             fps = _read_fps(video_path)
 
@@ -143,7 +147,8 @@ def inpaint_chunk(
         if completed_count == total_chunks:
             from workers.stitching.tasks import stitch_all_chunks
             stitch_all_chunks.apply_async(
-                args=[job_id, total_chunks],
+                # segment_s3_key = the original video, used to restore audio
+                args=[job_id, total_chunks, segment_s3_key],
                 queue="stitching",
             )
 

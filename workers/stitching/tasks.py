@@ -95,8 +95,14 @@ def stitch_all_chunks(
     self,
     job_id: str,
     total_chunks: int,
+    original_s3_key: str | None = None,
 ) -> dict[str, Any]:
-    """Concatenate every inpainted chunk into the final result video via ffmpeg."""
+    """Concatenate every inpainted chunk into the final result video via ffmpeg.
+
+    When original_s3_key is given, the source video's audio track is muxed
+    back into the (silent) inpainted output; videos without audio pass
+    through unchanged.
+    """
     settings = get_settings()
     bound_log = log.bind(job_id=job_id, total_chunks=total_chunks, task_id=self.request.id)
     bound_log.info("chunk_stitching_started")
@@ -136,6 +142,11 @@ def stitch_all_chunks(
             )
             if result.returncode != 0:
                 raise RuntimeError(f"ffmpeg concat failed: {result.stderr}")
+
+            if original_s3_key:
+                output_path = _mux_original_audio(
+                    s3, settings, tmp, original_s3_key, output_path, bound_log
+                )
 
             result_s3_key = f"jobs/{job_id}/result/output.mp4"
             s3.upload_file(output_path, settings.s3_bucket, result_s3_key)
@@ -178,6 +189,59 @@ def stitch_all_chunks(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _mux_original_audio(
+    s3: Any,
+    settings: Any,
+    tmp: str,
+    original_s3_key: str,
+    video_path: str,
+    bound_log: Any,
+) -> str:
+    """Copy the original video's audio track onto the inpainted video.
+
+    Best-effort: if the original has no audio (or muxing fails) the silent
+    inpainted video is returned unchanged rather than failing the job.
+    """
+    original_path = os.path.join(tmp, "original.mp4")
+    s3.download_file(settings.s3_bucket, original_s3_key, original_path)
+
+    # .mka (Matroska audio) accepts any codec with stream copy, so this works
+    # for AAC and MP3 sources alike without a probe step.
+    audio_path = os.path.join(tmp, "audio.mka")
+    extract = subprocess.run(
+        ["ffmpeg", "-y", "-i", original_path, "-vn", "-acodec", "copy", audio_path],
+        capture_output=True,
+        text=True,
+    )
+    if extract.returncode != 0:
+        bound_log.info("audio_extract_skipped", detail=extract.stderr[-300:])
+        SEGMENTS_TOTAL.labels(status="audio_mux_skipped").inc()
+        return video_path
+
+    muxed_path = os.path.join(tmp, "output_with_audio.mp4")
+    mux = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", audio_path,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", "-c:a", "aac",
+            "-shortest",
+            muxed_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if mux.returncode != 0:
+        bound_log.warning("audio_mux_failed", detail=mux.stderr[-300:])
+        SEGMENTS_TOTAL.labels(status="audio_mux_failed").inc()
+        return video_path
+
+    bound_log.info("audio_muxed_from_original", original_s3_key=original_s3_key)
+    SEGMENTS_TOTAL.labels(status="audio_muxed").inc()
+    return muxed_path
+
 
 def _make_s3_client(settings: Any) -> Any:
     """Return a boto3 S3 client configured for the MinIO endpoint."""

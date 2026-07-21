@@ -31,8 +31,10 @@ from workers.celery_app import celery_app  # noqa: E402
     bind=True,
     queue="segmentation",
     max_retries=2,
-    soft_time_limit=300,
-    time_limit=360,
+    # Generous limits: this task now also runs SAM2 VP tracking over the full
+    # video (~30s per 360 frames) plus CPU OIV refinement.
+    soft_time_limit=900,
+    time_limit=1020,
     name="workers.segmentation.tasks.segment_first_frame",
 )
 def segment_first_frame(
@@ -94,65 +96,101 @@ def segment_first_frame(
 
             total_frames, _fps = _get_frame_count_and_fps(video_path)
 
-        loop.run_until_complete(
-            _publish(job_id, {"stage": "segmenting", "pct": 100})
-        )
-        SEGMENTS_TOTAL.labels(status=f"segmentation_{status}").inc()
-
-        if settings.chunking_enabled:
-            chunks = []
-            for start in range(0, total_frames, CHUNK_SIZE):
-                end = min(start + CHUNK_SIZE, total_frames)
-                chunks.append((start, end))
-            total_chunks = len(chunks)
-
-            bound_log.info(
-                "chunking_video",
-                total_frames=total_frames,
-                total_chunks=total_chunks,
-                chunk_size=CHUNK_SIZE,
+            loop.run_until_complete(
+                _publish(job_id, {"stage": "segmenting", "pct": 100})
             )
-            SEGMENTS_TOTAL.labels(status="chunking_dispatched").inc()
+            SEGMENTS_TOTAL.labels(status=f"segmentation_{status}").inc()
 
-            from workers.db import set_job_total_chunks
-            set_job_total_chunks(job_id, total_chunks)
-
-            from workers.segmentation.chunk_tasks import track_masks_chunk
-            for chunk_index, (start_frame, end_frame) in enumerate(chunks):
-                track_masks_chunk.apply_async(
-                    args=[
-                        job_id,
-                        chunk_index,
-                        total_chunks,
-                        segment_s3_key,
-                        mask_s3_key,
-                        start_frame,
-                        end_frame,
-                    ],
-                    queue="segmentation",
-                )
+            # Track ALL frames in one pass with SAM2 Video Predictor on the
+            # local GPU — replaces the sequential per-chunk XMem++ Modal calls.
+            from workers.segmentation.sam2_video_tracker import (
+                track_with_sam2_video_predictor,
+            )
 
             loop.run_until_complete(
-                _update_status(job_id, JobStatus.TRACKING, extra={"total_chunks": total_chunks})
+                _update_status(job_id, JobStatus.TRACKING, None)
+            )
+            loop.run_until_complete(
+                _publish(job_id, {"stage": "tracking", "pct": 0})
+            )
+            SEGMENTS_TOTAL.labels(status="sam2_vp_tracking_started").inc()
+            bound_log.info("sam2_vp_tracking_started", total_frames=total_frames)
+
+            def _tracking_progress(pct: int) -> None:
+                loop.run_until_complete(
+                    _publish(job_id, {"stage": "tracking", "pct": pct})
+                )
+
+            tracked_masks = track_with_sam2_video_predictor(
+                video_path=video_path,
+                first_frame_mask=mask_array,
+                model_cache_dir=settings.model_cache_dir,
+                device=settings.device,
+                on_progress=_tracking_progress,
+            )
+            # Trust the decoded frame count over container metadata so chunk
+            # ranges always line up with the mask array.
+            total_frames = len(tracked_masks)
+
+            masks_key = f"jobs/{job_id}/masks/tracked_masks.npy"
+            tracked_path = os.path.join(tmp, "tracked_masks.npy")
+            np.save(tracked_path, tracked_masks)
+            s3.upload_file(tracked_path, settings.s3_bucket, masks_key)
+
+            loop.run_until_complete(
+                _publish(job_id, {"stage": "tracking", "pct": 100})
+            )
+            SEGMENTS_TOTAL.labels(status="sam2_vp_tracking_complete").inc()
+            bound_log.info(
+                "sam2_vp_tracking_complete",
+                total_frames=total_frames,
+                masks_key=masks_key,
             )
 
-            return {
-                "job_id": job_id,
-                "segment_s3_key": segment_s3_key,
-                "mask_s3_key": mask_s3_key,
-                "total_chunks": total_chunks,
-                "status": status,
-            }
+        chunks = []
+        for start in range(0, total_frames, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, total_frames)
+            chunks.append((start, end))
+        total_chunks = len(chunks)
 
-        track_masks.apply_async(
-            args=[job_id, segment_s3_key, mask_s3_key],
-            queue="segmentation",
+        bound_log.info(
+            "chunking_video",
+            total_frames=total_frames,
+            total_chunks=total_chunks,
+            chunk_size=CHUNK_SIZE,
+        )
+        SEGMENTS_TOTAL.labels(status="chunking_dispatched").inc()
+
+        from workers.db import set_job_total_chunks
+        set_job_total_chunks(job_id, total_chunks)
+
+        from workers.inpainting.chunk_tasks import inpaint_chunk
+        for chunk_index, (start_frame, end_frame) in enumerate(chunks):
+            inpaint_chunk.apply_async(
+                args=[
+                    job_id,
+                    chunk_index,
+                    total_chunks,
+                    segment_s3_key,
+                    masks_key,  # full tracked masks; each chunk slices its range
+                    start_frame,
+                    end_frame,
+                ],
+                queue="inpainting",
+            )
+
+        loop.run_until_complete(
+            _update_status(
+                job_id, JobStatus.INPAINTING, extra={"total_chunks": total_chunks}
+            )
         )
 
         return {
             "job_id": job_id,
             "segment_s3_key": segment_s3_key,
             "mask_s3_key": mask_s3_key,
+            "tracked_masks_s3_key": masks_key,
+            "total_chunks": total_chunks,
             "status": status,
         }
 
@@ -188,7 +226,12 @@ def track_masks(
     segment_s3_key: str,
     mask_s3_key: str,
 ) -> dict[str, Any]:
-    """Propagate the SAM2 first-frame mask across all frames with XMem."""
+    """Propagate the SAM2 first-frame mask across all frames with XMem.
+
+    DEPRECATED: no longer dispatched — segment_first_frame now tracks the full
+    video with SAM2 Video Predictor (see sam2_video_tracker.py). Kept for
+    reference only.
+    """
     settings = get_settings()
     bound_log = log.bind(
         job_id=job_id,

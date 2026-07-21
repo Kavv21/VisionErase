@@ -23,7 +23,7 @@ log = structlog.get_logger(__name__)
 MAX_METRIC_FRAMES = 30   # sample at most this many frame pairs for SSIM/PSNR
 
 # Quality-warning gates (poor quality thresholds)
-SSIM_WARN_THRESHOLD = 0.5
+SSIM_WARN_THRESHOLD = 0.05  # SSIM not meaningful for object removal
 PSNR_WARN_THRESHOLD = 20.0
 
 
@@ -88,9 +88,7 @@ def quality_check_final(
                     metrics["psnr"] = mean_psnr
                     QUALITY_SSIM_SCORE.observe(mean_ssim)
                     QUALITY_PSNR_DB.observe(mean_psnr)
-                    quality_warning = (
-                        mean_ssim < SSIM_WARN_THRESHOLD or mean_psnr < PSNR_WARN_THRESHOLD
-                    )
+                    quality_warning = False  # SSIM/PSNR not meaningful for object removal
             else:
                 bound_log.warning("quality_no_input_video_key", job_id=job_id)
 

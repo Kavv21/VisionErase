@@ -118,6 +118,22 @@ def mock_sam2(monkeypatch):
 
 
 @pytest.fixture()
+def mock_vp_tracker(monkeypatch):
+    """Patch SAM2 Video Predictor tracking so no real model/GPU/video is needed.
+
+    segment_first_frame imports track_with_sam2_video_predictor at call time,
+    so patching the source module attribute intercepts it.
+    """
+    tracked = np.zeros((150, 64, 64), dtype=np.uint8)
+    tracker = mock.MagicMock(return_value=tracked)
+    monkeypatch.setattr(
+        "workers.segmentation.sam2_video_tracker.track_with_sam2_video_predictor",
+        tracker,
+    )
+    return tracker
+
+
+@pytest.fixture()
 def mock_video(monkeypatch):
     """Patch cv2 so VideoCapture yields a finite frame sequence for track_masks.
 
@@ -222,7 +238,7 @@ def test_segment_first_frame_queue(app):
 
 @pytest.mark.unit
 class TestSegmentFirstFrameReal:
-    def test_returns_status_real(self, mock_s3, mock_frame, mock_sam2):
+    def test_returns_status_real(self, mock_s3, mock_frame, mock_sam2, mock_vp_tracker):
         from workers.segmentation.tasks import segment_first_frame
 
         result = segment_first_frame.apply(
@@ -231,7 +247,7 @@ class TestSegmentFirstFrameReal:
 
         assert result["status"] == "real"
 
-    def test_returns_correct_dict_shape(self, mock_s3, mock_frame, mock_sam2):
+    def test_returns_correct_dict_shape(self, mock_s3, mock_frame, mock_sam2, mock_vp_tracker):
         from workers.segmentation.tasks import segment_first_frame
 
         result = segment_first_frame.apply(
@@ -242,21 +258,22 @@ class TestSegmentFirstFrameReal:
             "job_id",
             "segment_s3_key",
             "mask_s3_key",
+            "tracked_masks_s3_key",
             "total_chunks",
             "status",
         }
 
-    def test_total_chunks_matches_frame_count(self, mock_s3, mock_frame, mock_sam2):
-        """150 frames / CHUNK_SIZE=60 → 3 chunks (60, 60, 30)."""
+    def test_total_chunks_matches_frame_count(self, mock_s3, mock_frame, mock_sam2, mock_vp_tracker):
+        """150 tracked masks / CHUNK_SIZE=30 → 5 inpainting chunks."""
         from workers.segmentation.tasks import segment_first_frame
 
         result = segment_first_frame.apply(
             args=["job-real", "jobs/job-real/segments/seg_0.mp4", VALID_MASK_DATA]
         ).get()
 
-        assert result["total_chunks"] == 3
+        assert result["total_chunks"] == 5
 
-    def test_mask_s3_key_matches_expected_path(self, mock_s3, mock_frame, mock_sam2):
+    def test_mask_s3_key_matches_expected_path(self, mock_s3, mock_frame, mock_sam2, mock_vp_tracker):
         from workers.segmentation.tasks import segment_first_frame
 
         result = segment_first_frame.apply(
@@ -265,7 +282,7 @@ class TestSegmentFirstFrameReal:
 
         assert result["mask_s3_key"] == "jobs/job-real/masks/frame_0_mask.npy"
 
-    def test_downloads_segment_and_uploads_mask(self, mock_s3, mock_frame, mock_sam2):
+    def test_downloads_segment_and_uploads_mask(self, mock_s3, mock_frame, mock_sam2, mock_vp_tracker):
         from workers.segmentation.tasks import segment_first_frame
 
         segment_first_frame.apply(
@@ -276,7 +293,7 @@ class TestSegmentFirstFrameReal:
         assert mock_s3.upload_file.called
 
     def test_publishes_progress_at_0_50_100(
-        self, mock_s3, mock_frame, mock_sam2, mock_redis
+        self, mock_s3, mock_frame, mock_sam2, mock_vp_tracker, mock_redis
     ):
         from workers.segmentation.tasks import segment_first_frame
 
@@ -293,7 +310,7 @@ class TestSegmentFirstFrameReal:
 
 @pytest.mark.unit
 class TestSegmentFirstFrameEmptyPoints:
-    def test_empty_points_list_returns_empty_status(self, mock_s3, mock_frame):
+    def test_empty_points_list_returns_empty_status(self, mock_s3, mock_frame, mock_vp_tracker):
         from workers.segmentation.tasks import segment_first_frame
 
         result = segment_first_frame.apply(
@@ -302,7 +319,7 @@ class TestSegmentFirstFrameEmptyPoints:
 
         assert result["status"] == "empty"
 
-    def test_missing_points_key_does_not_crash(self, mock_s3, mock_frame):
+    def test_missing_points_key_does_not_crash(self, mock_s3, mock_frame, mock_vp_tracker):
         from workers.segmentation.tasks import segment_first_frame
 
         result = segment_first_frame.apply(
@@ -313,7 +330,7 @@ class TestSegmentFirstFrameEmptyPoints:
         assert result["mask_s3_key"] == "jobs/job-empty2/masks/frame_0_mask.npy"
 
     def test_empty_points_still_publishes_progress_at_0_50_100(
-        self, mock_s3, mock_frame, mock_redis
+        self, mock_s3, mock_frame, mock_vp_tracker, mock_redis
     ):
         from workers.segmentation.tasks import segment_first_frame
 

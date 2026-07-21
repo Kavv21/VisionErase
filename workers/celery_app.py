@@ -48,8 +48,10 @@ celery_app.autodiscover_tasks([
 ])
 # Full-video chunking tasks live in chunk_tasks.py alongside each stage's
 # tasks.py — a second autodiscover pass with related_name picks them up.
+# workers.segmentation.chunk_tasks (XMem++ chunk tracking) is deliberately
+# excluded: SAM2 Video Predictor now tracks the whole video in one pass.
 celery_app.autodiscover_tasks(
-    ["workers.segmentation", "workers.inpainting"],
+    ["workers.inpainting"],
     related_name="chunk_tasks",
 )
 
