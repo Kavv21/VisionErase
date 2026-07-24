@@ -27,6 +27,70 @@ CHUNK_SIZE = 30  # smaller chunks = better temporal consistency  # frames per ch
 from workers.celery_app import celery_app  # noqa: E402
 
 
+def detect_and_add_shadow(frame_rgb, object_mask, dilation_px=20):
+    """
+    Expand mask to include shadow region near the object.
+    Uses two approaches:
+    1. Simple dilation (catches nearby shadows)
+    2. HSV darkness detection connected to object
+    """
+    import cv2
+
+    H, W = frame_rgb.shape[:2]
+
+    # Method 1: Dilate mask to catch nearby shadow
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (dilation_px * 2 + 1, dilation_px * 2 + 1)
+    )
+    dilated = cv2.dilate(object_mask, kernel, iterations=1)
+
+    # Method 2: Find dark regions connected to object
+    hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    V = hsv[:, :, 2]  # brightness channel
+
+    # Estimate background brightness (median outside mask). A mask covering the
+    # whole frame leaves nothing to sample — np.median would return nan and taint
+    # the threshold, so fall back to dilation-only in that case.
+    bg_pixels = V[object_mask == 0]
+    bg_brightness = float(np.median(bg_pixels)) if bg_pixels.size else 0.0
+
+    # Shadow = darker than background by >20%
+    shadow_threshold = bg_brightness * 0.80
+    dark_regions = (V < shadow_threshold).astype(np.uint8) * 255
+
+    # Shadow must be connected to the dilated object mask
+    combined = cv2.bitwise_or(dark_regions, dilated)
+
+    # Find connected components containing the object
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined)
+
+    # Keep components that overlap with original object mask
+    final_mask = np.zeros_like(object_mask)
+    for label in range(1, num_labels):
+        component = (labels == label).astype(np.uint8)
+        overlap = cv2.bitwise_and(
+            component,
+            (object_mask > 0).astype(np.uint8),
+        )
+        if overlap.sum() > 0:
+            final_mask = cv2.bitwise_or(final_mask, component * 255)
+
+    # Safety cap: reject expansion if > 4x original area
+    # Prevents swallowing large dark surfaces (asphalt, shaded floor)
+    original_area = float((object_mask > 0).sum())
+    expanded_area = float((final_mask > 0).sum())
+    if original_area > 0 and expanded_area > original_area * 4.0:
+        import logging
+        logging.warning(
+            f"shadow_expansion_capped: {expanded_area/original_area:.1f}x "
+            f"exceeds 4x limit, using dilation-only"
+        )
+        # Fall back to simple dilation only (no dark region detection)
+        final_mask = (dilated * 255).astype(np.uint8)
+
+    return final_mask.astype(np.uint8)
+
+
 @celery_app.task(
     bind=True,
     queue="segmentation",
@@ -42,6 +106,7 @@ def segment_first_frame(
     job_id: str,
     segment_s3_key: str,
     mask_data: dict[str, Any],
+    include_shadow: bool = True,
 ) -> dict[str, Any]:
     """Segment the target frame with SAM 2 given user-clicked points."""
     settings = get_settings()
@@ -86,7 +151,25 @@ def segment_first_frame(
                 status = "empty"
             else:
                 best_mask = _run_sam2_segmentation(frame_rgb, points, settings, bound_log)
+                # frame_rgb comes back from _extract_frame already RGB-converted.
                 mask_array = (best_mask.astype(np.uint8) * 255)
+                if include_shadow:
+                    # Auto-detect and include shadow region
+                    original_coverage = float((mask_array > 0).mean() * 100)
+                    mask_array = detect_and_add_shadow(
+                        frame_rgb=frame_rgb,
+                        object_mask=mask_array,
+                        dilation_px=20,
+                    )
+                    expanded_coverage = float((mask_array > 0).mean() * 100)
+                    bound_log.info(
+                        "shadow_detection_complete",
+                        original_coverage_pct=round(original_coverage, 2),
+                        expanded_coverage_pct=round(expanded_coverage, 2),
+                        shadow_added_pct=round(expanded_coverage - original_coverage, 2),
+                    )
+                else:
+                    bound_log.info("shadow_detection_skipped")
                 status = "real"
 
             mask_s3_key = f"jobs/{job_id}/masks/frame_{frame_index}_mask.npy"

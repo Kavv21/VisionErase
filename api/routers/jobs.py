@@ -68,7 +68,11 @@ async def create_job(
 ) -> JobResponse:
     """Submit a job; returns 200 + cached=True on dedup hit, 202 on new enqueue."""
     mask_dict = req.mask.model_dump()
-    job_hash = compute_job_hash(req.video_s3_key, mask_dict)
+    # include_shadow changes the mask the pipeline produces, so it has to be part
+    # of the dedup key — otherwise a shadow-off job returns a shadow-on result.
+    job_hash = compute_job_hash(
+        req.video_s3_key, {**mask_dict, "include_shadow": req.include_shadow}
+    )
     bound_log = log.bind(job_hash=job_hash, video_s3_key=req.video_s3_key)
 
     cached = await get_cached_result(redis, job_hash)
@@ -131,11 +135,15 @@ async def create_job(
     await enqueue_job(redis, job_id, queue_score, payload)
     # Dispatch to Celery segmentation worker
     segment_first_frame.apply_async(
-        args=[job_id, req.video_s3_key, mask_dict],
+        args=[job_id, req.video_s3_key, mask_dict, req.include_shadow],
         queue="segmentation",
         priority=int(req.priority),
     )
-    bound_log.info("job_accepted", priority=req.priority.name)
+    bound_log.info(
+        "job_accepted",
+        priority=req.priority.name,
+        include_shadow=req.include_shadow,
+    )
     JOB_SUBMISSIONS_TOTAL.labels(outcome="accepted").inc()
 
     response.status_code = status.HTTP_202_ACCEPTED

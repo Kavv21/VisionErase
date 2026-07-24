@@ -155,6 +155,20 @@ def track_with_sam2_video_predictor(
             for line in (result.stdout + result.stderr).splitlines()
             if line.strip() and "it/s" not in line
         )
+        # Extract and re-log OIV stats from subprocess output
+        import re as _re
+        oiv_match = _re.search(
+            r'oiv_refinement_stats\s+absent=(\d+)\s+confirmed=(\d+)\s+lost_no_embedding=(\d+)\s+recovered=(\d+)\s+total_frames=(\d+)',
+            sub_logs
+        )
+        if oiv_match:
+            log.info("oiv_refinement_stats",
+                absent=int(oiv_match.group(1)),
+                confirmed=int(oiv_match.group(2)),
+                lost_no_embedding=int(oiv_match.group(3)),
+                recovered=int(oiv_match.group(4)),
+                total_frames=int(oiv_match.group(5)),
+            )
         log.info(
             "sam2_vp_subprocess_complete",
             num_frames=len(tracked),

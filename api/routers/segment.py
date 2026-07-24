@@ -50,7 +50,13 @@ async def segment_preview(
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(
-            None, _run_sam2_preview, req.video_s3_key, req.frame_index, req.points, settings
+            None,
+            _run_sam2_preview,
+            req.video_s3_key,
+            req.frame_index,
+            req.points,
+            settings,
+            req.include_shadow,
         )
     except Exception as exc:
         SEGMENT_PREVIEW_ERRORS_TOTAL.inc()
@@ -69,6 +75,7 @@ def _run_sam2_preview(
     frame_index: int,
     points: list[MaskPoint],
     settings: Any,
+    include_shadow: bool = True,
 ) -> dict[str, Any]:
     """Download the frame, run SAM2 with the given points, return a mask PNG.
 
@@ -82,7 +89,11 @@ def _run_sam2_preview(
 
     # Rule: always load models through the model pool, never directly.
     from pipeline.pool.model_pool import get_model_pool
-    from workers.segmentation.tasks import _extract_frame, _load_sam2_model
+    from workers.segmentation.tasks import (
+        _extract_frame,
+        _load_sam2_model,
+        detect_and_add_shadow,
+    )
 
     s3 = _s3_client()
     with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +122,24 @@ def _run_sam2_preview(
     score = float(scores[best_idx])
 
     mask_uint8 = (best_mask.astype(np.uint8) * 255)
+
+    if include_shadow:
+        # Same expansion the worker applies, so the purple overlay the user
+        # confirms is exactly the region that will be inpainted.
+        original_coverage = float((mask_uint8 > 0).mean() * 100)
+        mask_uint8 = detect_and_add_shadow(
+            frame_rgb=frame_rgb,
+            object_mask=mask_uint8,
+            dilation_px=20,
+        )
+        expanded_coverage = float((mask_uint8 > 0).mean() * 100)
+        log.info(
+            "shadow_detection_complete",
+            original_coverage_pct=round(original_coverage, 2),
+            expanded_coverage_pct=round(expanded_coverage, 2),
+            shadow_added_pct=round(expanded_coverage - original_coverage, 2),
+        )
+
     ok, encoded = cv2.imencode(".png", mask_uint8)
     if not ok:
         raise RuntimeError("failed to encode SAM2 mask as PNG")

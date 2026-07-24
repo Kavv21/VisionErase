@@ -41,6 +41,7 @@ class CreateJobRequest(BaseModel):
     priority: JobPriority = JobPriority.NORMAL
     webhook_url: str | None = None
     output_format: str | None = None  # None → preserve input container format
+    include_shadow: bool = True  # expand the mask to cover the object's shadow
 
 
 class SegmentStatus(BaseModel):
@@ -71,6 +72,8 @@ class SegmentPreviewRequest(BaseModel):
     video_s3_key: str
     points: list[MaskPoint]
     frame_index: int = 0
+    # Mirrors CreateJobRequest so the preview overlay matches what the job removes.
+    include_shadow: bool = True
 
 
 class SegmentPreviewResponse(BaseModel):
