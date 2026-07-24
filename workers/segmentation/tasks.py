@@ -20,7 +20,18 @@ MAX_TRACKING_FRAMES = 60    # process 60 frames per chunk to avoid RAM OOM
 TRACKING_WIDTH      = 854   # resize to 480p
 TRACKING_HEIGHT     = 480
 
-CHUNK_SIZE = 30  # smaller chunks = better temporal consistency  # frames per chunk when splitting a full video for chunked tracking
+# Chunks overlap so the stitcher can cross-fade the seam instead of hard-cutting.
+# CHUNK_SIZE is capped by RAFT's correlation volume inside ProPainter, which is
+# allocated over the whole chunk as (T-1) x (H*W/64)^2 x 4 bytes. Measured on
+# the A10G at 854x480: T=80 -> 11.5GB OOM, T=50 -> 7.1GB OOM, T=49 -> only just
+# fits. 40 leaves real headroom (see pipeline/modal_propainter.py).
+# OVERLAP must stay < STRIDE, otherwise the final chunk can be shorter than the
+# blend region and the stitcher cannot cross-fade it.
+CHUNK_SIZE = 40                    # larger chunk = better ProPainter temporal context
+OVERLAP    = 10                    # frames shared between adjacent chunks (25%, as at 80/20)
+STRIDE     = CHUNK_SIZE - OVERLAP  # = 30 frames advance per chunk
+
+OVERLAP_KEY_TTL = 86400  # 24h — must outlive inpainting so stitching can read it
 
 
 # Import celery_app lazily to avoid circular imports at module load time.
@@ -86,7 +97,7 @@ def detect_and_add_shadow(frame_rgb, object_mask, dilation_px=20):
             f"exceeds 4x limit, using dilation-only"
         )
         # Fall back to simple dilation only (no dark region detection)
-        final_mask = (dilated * 255).astype(np.uint8)
+        final_mask = dilated.copy()
 
     return final_mask.astype(np.uint8)
 
@@ -241,16 +252,31 @@ def segment_first_frame(
             )
 
         chunks = []
-        for start in range(0, total_frames, CHUNK_SIZE):
+        start = 0
+        while start < total_frames:
             end = min(start + CHUNK_SIZE, total_frames)
             chunks.append((start, end))
+            if end >= total_frames:
+                break
+            start += STRIDE
         total_chunks = len(chunks)
+
+        # The stitcher needs OVERLAP to know how many frames to cross-fade, and
+        # total_frames to verify it reassembled the video without gaps.
+        # A single chunk has no seam, so publish overlap=0 and let the stitcher
+        # take its plain-concat path.
+        effective_overlap = OVERLAP if total_chunks > 1 else 0
+        loop.run_until_complete(
+            _store_stitch_params(job_id, effective_overlap, total_frames)
+        )
 
         bound_log.info(
             "chunking_video",
             total_frames=total_frames,
             total_chunks=total_chunks,
             chunk_size=CHUNK_SIZE,
+            overlap=effective_overlap,
+            stride=STRIDE,
         )
         SEGMENTS_TOTAL.labels(status="chunking_dispatched").inc()
 
@@ -584,6 +610,21 @@ def _run_sam2_segmentation(
 
     bound_log.info("sam2_inference_complete")
     return masks[0]
+
+
+async def _store_stitch_params(job_id: str, overlap: int, total_frames: int) -> None:
+    """Publish the chunk overlap and frame count for stitch_all_chunks to read.
+
+    Rule 6: every Redis key gets a TTL, so these use setex rather than set.
+    """
+    from redis import asyncio as _aioredis
+    from api.core.config import get_settings as _get_settings
+    _r = _aioredis.Redis.from_url(_get_settings().redis_url, decode_responses=True)
+    try:
+        await _r.setex(f"job:{job_id}:overlap", OVERLAP_KEY_TTL, overlap)
+        await _r.setex(f"job:{job_id}:total_frames", OVERLAP_KEY_TTL, total_frames)
+    finally:
+        await _r.aclose()
 
 
 async def _publish(job_id: str, data: dict) -> None:

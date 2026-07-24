@@ -158,9 +158,14 @@ def inpaint_frames(frames_bytes, masks_bytes, fps=24.0):
     masked_frames = frames_t * (1 - mask_dil_t)
 
     RAFT_ITERS      = 10  # reduced for memory
-    NEIGHBOR_LENGTH = 10
-    REF_STRIDE      = 10
+    NEIGHBOR_LENGTH = 20  # wider window for the larger overlapping chunks
+    REF_STRIDE      = 15
     SUBVIDEO_LENGTH = 80
+
+    # RAFT builds its correlation volume over the whole clip at once:
+    # (T-1) x (H*W/64)^2 x 4 bytes. At 854x480 that is ~7.3GB for T=50 but
+    # ~11.9GB for T=80, which OOMs the A10G alongside the loaded models.
+    # CHUNK_SIZE in workers/segmentation/tasks.py must stay within this bound.
 
     with torch.no_grad():
         print("Computing optical flow...")

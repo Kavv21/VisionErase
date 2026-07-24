@@ -264,14 +264,16 @@ class TestSegmentFirstFrameReal:
         }
 
     def test_total_chunks_matches_frame_count(self, mock_s3, mock_frame, mock_sam2, mock_vp_tracker):
-        """150 tracked masks / CHUNK_SIZE=30 → 5 inpainting chunks."""
-        from workers.segmentation.tasks import segment_first_frame
+        """150 tracked masks split into overlapping CHUNK_SIZE chunks every STRIDE."""
+        from workers.segmentation.tasks import CHUNK_SIZE, STRIDE, segment_first_frame
+
+        expected = 1 + max(0, -(-(150 - CHUNK_SIZE) // STRIDE))  # ceil division
 
         result = segment_first_frame.apply(
             args=["job-real", "jobs/job-real/segments/seg_0.mp4", VALID_MASK_DATA]
         ).get()
 
-        assert result["total_chunks"] == 5
+        assert result["total_chunks"] == expected
 
     def test_mask_s3_key_matches_expected_path(self, mock_s3, mock_frame, mock_sam2, mock_vp_tracker):
         from workers.segmentation.tasks import segment_first_frame
