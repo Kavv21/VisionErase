@@ -106,10 +106,11 @@ def detect_and_add_shadow(frame_rgb, object_mask, dilation_px=20):
     bind=True,
     queue="segmentation",
     max_retries=2,
-    # Generous limits: this task now also runs SAM2 VP tracking over the full
-    # video (~30s per 360 frames) plus CPU OIV refinement.
-    soft_time_limit=900,
-    time_limit=1020,
+    # Sized for long videos: SAM2 VP tracking at ~0.15s/frame plus CPU OIV
+    # refinement runs to completion within one task, up to the 60-min video cap
+    # enforced below (~86k frames = ~13000s tracking + refinement).
+    soft_time_limit=7200,
+    time_limit=7500,
     name="workers.segmentation.tasks.segment_first_frame",
 )
 def segment_first_frame(
@@ -149,6 +150,20 @@ def segment_first_frame(
         with tempfile.TemporaryDirectory() as tmp:
             video_path = os.path.join(tmp, "segment.mp4")
             s3.download_file(settings.s3_bucket, segment_s3_key, video_path)
+
+            probe_frames, probe_fps = _get_frame_count_and_fps(video_path)
+            duration_sec = probe_frames / probe_fps if probe_fps > 0 else 0.0
+            if duration_sec > settings.max_video_duration_sec:
+                bound_log.warning(
+                    "video_too_long",
+                    duration_sec=round(duration_sec, 1),
+                    max_duration_sec=settings.max_video_duration_sec,
+                    total_frames=probe_frames,
+                )
+                raise ValueError(
+                    f"video duration {duration_sec:.1f}s exceeds cap "
+                    f"{settings.max_video_duration_sec}s"
+                )
 
             frame_rgb = _extract_frame(video_path, frame_index)
 

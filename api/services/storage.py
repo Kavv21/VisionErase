@@ -17,7 +17,12 @@ def _s3_client() -> Any:
         endpoint_url=settings.s3_endpoint_url,
         aws_access_key_id=settings.aws_access_key_id,
         aws_secret_access_key=settings.aws_secret_access_key,
-        config=Config(signature_version="s3v4"),
+        config=Config(
+            signature_version="s3v4",
+            connect_timeout=30,
+            read_timeout=300,       # 5 min for large file uploads
+            retries={"max_attempts": 3},
+        ),
     )
 async def generate_upload_url(
     filename: str,

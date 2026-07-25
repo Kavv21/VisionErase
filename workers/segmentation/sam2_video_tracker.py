@@ -70,7 +70,7 @@ result = _track(
 np.save(sys.argv[2], result)
 """
 
-SUBPROCESS_TIMEOUT_SEC = 600
+SUBPROCESS_TIMEOUT_SEC = 7200  # 2h — long enough for a 60-min video (~86k frames × 0.15s/frame)
 
 
 def track_with_sam2_video_predictor(
@@ -348,6 +348,23 @@ def _track(
             frames_done += num_frames
             shutil.rmtree(seg_dir, ignore_errors=True)
             segment_index += 1
+            total_estimate = max_reads if max_reads is not None else frames_done
+            log.info(
+                "long_video_progress",
+                segments_done=segment_index,
+                segments_total=(
+                    (total_estimate + MAX_SEGMENT_FRAMES - 1) // MAX_SEGMENT_FRAMES
+                    if total_estimate
+                    else segment_index
+                ),
+                frames_done=frames_done,
+                total_frames=total_estimate,
+                pct_complete=(
+                    round(frames_done / total_estimate * 100, 1)
+                    if total_estimate
+                    else None
+                ),
+            )
             if num_frames < budget or (max_reads is not None and frames_done >= max_reads):
                 break
     finally:

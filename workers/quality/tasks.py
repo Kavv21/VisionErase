@@ -143,7 +143,16 @@ def quality_check_final(
 # ── Metric helpers ────────────────────────────────────────────────────────────
 
 def _read_frames_sampled(video_path: str, max_frames: int) -> list[np.ndarray]:
-    """Read up to max_frames evenly spaced RGB frames from a video."""
+    """Read up to max_frames evenly spaced RGB frames from a video.
+
+    Decodes sequentially rather than seeking with CAP_PROP_POS_FRAMES. Seeking
+    lands on the nearest decodable frame, and since the source and our
+    re-encoded result have different keyframe layouts, the two videos get
+    sampled at different timestamps — so SSIM/PSNR end up scoring temporal
+    misalignment instead of inpainting quality. Measured on the Wimbledon clip:
+    seeking reported SSIM 0.33 where a sequential read of the very same two
+    files gives 0.96.
+    """
     import cv2
 
     cap = cv2.VideoCapture(video_path)
@@ -152,14 +161,18 @@ def _read_frames_sampled(video_path: str, max_frames: int) -> list[np.ndarray]:
         cap.release()
         return []
 
-    indices = np.unique(np.linspace(0, total - 1, min(max_frames, total)).astype(int))
+    wanted = set(
+        np.unique(np.linspace(0, total - 1, min(max_frames, total)).astype(int)).tolist()
+    )
     frames: list[np.ndarray] = []
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+    index = 0
+    while len(frames) < len(wanted):
         ret, frame_bgr = cap.read()
         if not ret:
             break
-        frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        if index in wanted:
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        index += 1
     cap.release()
     return frames
 

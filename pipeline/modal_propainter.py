@@ -80,13 +80,23 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
     memory=16384,
 )
 def inpaint_frames(frames_bytes, masks_bytes, fps=24.0):
-    import sys, os, cv2, torch, numpy as np, tempfile, io, subprocess
+    import sys, os, gc, cv2, torch, numpy as np, tempfile, io, subprocess
     from PIL import Image
     from scipy.ndimage import binary_dilation
 
     sys.path.insert(0, "/ProPainter")
     device    = torch.device("cuda")
     model_dir = "/weights/propainter"
+
+    # Modal reuses warm containers, and this function loads its models fresh on
+    # every call. Without an explicit reclaim, each invocation starts with the
+    # previous one's weights and intermediates still held by the caching
+    # allocator — the third call onwards then OOMs on allocations that fit fine
+    # in a cold container. Release before sizing anything for this call.
+    gc.collect()
+    torch.cuda.empty_cache()
+    free_b, total_b = torch.cuda.mem_get_info()
+    print(f"GPU free {free_b/1e9:.1f}GB of {total_b/1e9:.1f}GB at entry")
 
     # Decode
     frames = [np.array(Image.open(io.BytesIO(b)).convert("RGB")) for b in frames_bytes]
@@ -101,9 +111,20 @@ def inpaint_frames(frames_bytes, masks_bytes, fps=24.0):
     frames_orig = [f.copy() for f in frames]
     out_size = (W, H)
 
-    # Cap resolution
-    MAX_W, MAX_H = 854, 480  # A10G 24GB can handle this resolution
+    # Cap resolution. Raised from 854x480 so ROI crops (see compute_roi_crop in
+    # workers/inpainting/chunk_tasks.py) pass through at native resolution.
+    MAX_W, MAX_H = 960, 720
+    # RAFT allocates its correlation volume for the whole clip in one contiguous
+    # block, as (T-1) x (H*W/64)^2 x 4 bytes — quadratic in pixel count. A pixel
+    # budget backstops the per-axis caps above, which on their own would let a
+    # 960x720 crop ask for ~18GB and OOM the A10G.
+    # Measured at T=40: 854x480 (409,920px) allocates 5.96GiB and fits; 784x584
+    # (457,856px) asks for 7.29GiB and OOMs. So the budget is pinned to the
+    # larger proven-good area rather than a theoretical headroom estimate.
+    MAX_PIXELS = 854 * 480
     scale    = min(MAX_W / W, MAX_H / H, 1.0)
+    if W * H * scale * scale > MAX_PIXELS:
+        scale = (MAX_PIXELS / (W * H)) ** 0.5
     W_new = (int(W * scale) // 8) * 8
     H_new = (int(H * scale) // 8) * 8
     if (W_new, H_new) != (W, H):
@@ -158,19 +179,50 @@ def inpaint_frames(frames_bytes, masks_bytes, fps=24.0):
     masked_frames = frames_t * (1 - mask_dil_t)
 
     RAFT_ITERS      = 10  # reduced for memory
-    NEIGHBOR_LENGTH = 20  # wider window for the larger overlapping chunks
+    # ProPainter's sparse temporal attention builds a (T_window*tokens)^2 matrix
+    # per window, so this is quadratic in memory. At 20 it asks for 3.6-4.1GB on
+    # a ~400k-pixel chunk and OOMs the A10G partway through a video. 10 is both
+    # ProPainter's own default and what the local path in
+    # workers/inpainting/tasks.py uses; the overlapping-chunk cross-fade in
+    # workers/stitching/tasks.py is what covers seams, not this window.
+    NEIGHBOR_LENGTH = 10
     REF_STRIDE      = 15
     SUBVIDEO_LENGTH = 80
 
-    # RAFT builds its correlation volume over the whole clip at once:
-    # (T-1) x (H*W/64)^2 x 4 bytes. At 854x480 that is ~7.3GB for T=50 but
-    # ~11.9GB for T=80, which OOMs the A10G alongside the loaded models.
-    # CHUNK_SIZE in workers/segmentation/tasks.py must stay within this bound.
+    # RAFT builds its correlation volume for every frame pair handed to it at
+    # once: (T-1) x (H*W/64)^2 x 4 bytes, and the bilinear_sampler patch above
+    # forces contiguous copies of it. Passing all 40 frames of a chunk at ~400k
+    # pixels peaks right at the A10G's 24GB and OOMs intermittently — chunk 2 of
+    # a video would die while chunk 3 of the same video survived.
+    # Computing the flows in short sub-clips gives identical results with peak
+    # memory bounded by SHORT_CLIP_LEN instead of the chunk length; this mirrors
+    # what the local path in workers/inpainting/tasks.py already does.
+    SHORT_CLIP_LEN = 12
 
     with torch.no_grad():
         print("Computing optical flow...")
         frames_t = frames_t.contiguous()  # fix cuDNN non-contiguous error
-        gt_flows_bi = fix_raft(frames_t, iters=RAFT_ITERS)
+        if video_length > SHORT_CLIP_LEN:
+            flows_f_list, flows_b_list = [], []
+            for f in range(0, video_length, SHORT_CLIP_LEN):
+                end_f = min(video_length, f + SHORT_CLIP_LEN)
+                # Sub-clips after the first re-include the previous frame so the
+                # pair spanning the boundary is not lost.
+                start_f = f if f == 0 else f - 1
+                flows_f, flows_b = fix_raft(frames_t[:, start_f:end_f], iters=RAFT_ITERS)
+                flows_f_list.append(flows_f)
+                flows_b_list.append(flows_b)
+                torch.cuda.empty_cache()
+            gt_flows_bi = (torch.cat(flows_f_list, dim=1), torch.cat(flows_b_list, dim=1))
+            del flows_f_list, flows_b_list, flows_f, flows_b
+        else:
+            gt_flows_bi = fix_raft(frames_t, iters=RAFT_ITERS)
+        torch.cuda.empty_cache()
+        assert gt_flows_bi[0].shape[1] == video_length - 1, (
+            f"flow count {gt_flows_bi[0].shape[1]} != {video_length - 1}"
+        )
+        print(f"Flows: {gt_flows_bi[0].shape}, "
+              f"GPU free {torch.cuda.mem_get_info()[0]/1e9:.1f}GB")
 
         print("Completing flow...")
         pred_flows_bi, _ = fix_flow.forward_bidirect_flow(gt_flows_bi, flow_mask_t)
@@ -247,12 +299,21 @@ def inpaint_frames(frames_bytes, masks_bytes, fps=24.0):
         if comp_frames[i] is None:
             comp_frames[i] = frames_inp[i]
 
-    # Composite only the inpainted patch into the full-resolution originals
+    # Everything below is CPU work (compositing + ffmpeg). Drop the models and
+    # intermediates now rather than at return, so a container reused for the
+    # next chunk does not inherit ~15GB of still-cached blocks.
     mask_dil_np = np.stack([
         (mask_dil_t[0, i, 0].cpu().numpy() > 0.5).astype(np.float32)
         for i in range(video_length)
     ])  # (T, H_small, W_small)
+    del (frames_t, flow_mask_t, mask_dil_t, masked_frames, gt_flows_bi,
+         pred_flows_bi, prop_imgs, updated_local_masks, updated_frames,
+         updated_masks, fix_raft, fix_flow, model)
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"GPU freed, {torch.cuda.mem_get_info()[0]/1e9:.1f}GB available")
 
+    # Composite only the inpainted patch into the full-resolution originals
     final_frames = []
     for i in range(video_length):
         orig = frames_orig[i]  # (H_orig, W_orig, 3) uint8

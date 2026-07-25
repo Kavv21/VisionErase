@@ -78,17 +78,36 @@ export async function apiUploadVideo(
   file: File,
   onProgress?: (pct: number) => void,
 ): Promise<VideoUploadResponse> {
-  const form = new FormData()
-  form.append('file', file)
-  const { data } = await apiClient.post<VideoUploadResponse>('/api/v1/jobs/upload', form, {
-  headers: {
-    'Content-Type': undefined,  // let browser set it with correct boundary
-  },
-  onUploadProgress: (ev) => {
-    if (onProgress && ev.total) onProgress(Math.round((ev.loaded / ev.total) * 100))
-  },
-})
-  return data
+  // Step 1: Get presigned PUT URL from API
+  const { upload_url, s3_key } = await apiRequestUploadUrl(
+    file.name,
+    file.type || 'video/mp4',
+    file.size,
+  )
+
+  // Step 2: Upload directly to MinIO via presigned URL
+  // This bypasses the FastAPI server entirely — no size limit
+  await new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('PUT', upload_url)
+    xhr.setRequestHeader('Content-Type', file.type || 'video/mp4')
+    xhr.upload.onprogress = (ev) => {
+      if (onProgress && ev.total) {
+        onProgress(Math.round((ev.loaded / ev.total) * 100))
+      }
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve()
+      } else {
+        reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`))
+      }
+    }
+    xhr.onerror = () => reject(new Error('Network error during upload'))
+    xhr.send(file)
+  })
+
+  return { s3_key, size_bytes: file.size }
 }
 
 export async function apiSegmentPreview(

@@ -158,3 +158,21 @@ QUALITY_TEMPORAL_CONSISTENCY = Histogram(
     "Mean cosine similarity between consecutive result frames",
     buckets=[0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 1.0],
 )
+
+INPAINT_ROI_MODE_TOTAL = Counter(
+    "visionerase_inpaint_roi_mode_total",
+    "Chunks inpainted per resolution mode (roi crop vs full frame)",
+    ["mode"],
+)
+
+INPAINT_ROI_COVERAGE = Histogram(
+    "visionerase_inpaint_roi_coverage_ratio",
+    "ROI crop area as a fraction of the full frame area",
+    buckets=[0.01, 0.05, 0.1, 0.2, 0.35, 0.5, 0.6, 0.8, 1.0],
+)
+
+INPAINT_POSTPROCESS_SECONDS = Histogram(
+    "visionerase_inpaint_postprocess_seconds",
+    "Time spent on three-zone blending, colour correction and grain per chunk",
+    buckets=[0.5, 1, 2.5, 5, 10, 20, 45, 90],
+)
