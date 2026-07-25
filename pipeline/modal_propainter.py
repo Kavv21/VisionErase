@@ -180,14 +180,20 @@ def inpaint_frames(frames_bytes, masks_bytes, fps=24.0):
 
     RAFT_ITERS      = 10  # reduced for memory
     # ProPainter's sparse temporal attention builds a (T_window*tokens)^2 matrix
-    # per window, so this is quadratic in memory. At 20 it asks for 3.6-4.1GB on
-    # a ~400k-pixel chunk and OOMs the A10G partway through a video. 10 is both
-    # ProPainter's own default and what the local path in
-    # workers/inpainting/tasks.py uses; the overlapping-chunk cross-fade in
-    # workers/stitching/tasks.py is what covers seams, not this window.
+    # per window, so both of these are quadratic in memory. The reference stride
+    # is the cheap half of the quality win: dropping it from 15 to 5 gives the
+    # transformer ~5 more real frames to copy from per pass (peak 13 -> 16
+    # frames, ~1.5x attention memory) instead of hallucinating.
+    #
+    # NEIGHBOR_LENGTH stays at 10. Widening it to 20 takes the peak to 24 frames
+    # (~3.4x) and OOMs the A10G — measured twice, most recently on job
+    # 38825adb, which died on chunks 3 and 4 with failed 2.59/2.74GiB allocs.
+    # Note SUBVIDEO_LENGTH does not backstop this at our chunk size: ref_num is
+    # only computed when video_length > SUBVIDEO_LENGTH, and chunks are 40
+    # frames, so the ref_num = -1 path is what actually runs.
     NEIGHBOR_LENGTH = 10
-    REF_STRIDE      = 15
-    SUBVIDEO_LENGTH = 80
+    REF_STRIDE      = 5
+    SUBVIDEO_LENGTH = 48
 
     # RAFT builds its correlation volume for every frame pair handed to it at
     # once: (T-1) x (H*W/64)^2 x 4 bytes, and the bilinear_sampler patch above

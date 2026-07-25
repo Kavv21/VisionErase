@@ -29,6 +29,16 @@ LARGE_MASK_COVERAGE_PCT = 50.0
 TINY_MASK_COVERAGE_PCT = 0.05
 JPEG_QUALITY = 95
 
+# Bidirectional tracking: a second SAM2 VP pass over the reversed video, seeded
+# with the forward pass's last mask. Where the two passes agree the mask is
+# trustworthy; where they diverge the object was probably lost or drifted.
+# It doubles tracking wall time and ffmpeg's `reverse` filter buffers the whole
+# decoded video in RAM, so it only runs on short clips.
+BACKWARD_TRACKING_MAX_FRAMES = 500
+HIGH_CONFIDENCE_IOU = 0.85   # >= this: intersection (both passes agree)
+MEDIUM_CONFIDENCE_IOU = 0.65  # >= this: union (OIV validates later)
+FFMPEG_REVERSE_TIMEOUT_SEC = 900
+
 
 # Executed in a fresh interpreter (sys.argv[1] = input pickle, sys.argv[2] =
 # output .npy). Celery's prefork workers cannot re-initialize CUDA ("Cannot
@@ -80,14 +90,209 @@ def track_with_sam2_video_predictor(
     device: str = "cuda",
     on_progress: Callable[[int], None] | None = None,
 ) -> "np.ndarray":
+    """Track the first-frame mask across the video, forward then (short clips) back.
+
+    The forward pass is authoritative. On clips of at most
+    BACKWARD_TRACKING_MAX_FRAMES a second pass runs over the reversed video and
+    the two are reconciled per frame by IoU (see compute_mask_consensus), which
+    catches drift the forward pass alone cannot see. Backward tracking is
+    strictly best-effort: anything that goes wrong falls back to the forward
+    masks rather than failing the job.
+    """
+    from api.core.metrics import TRACKING_CONSENSUS_IOU, TRACKING_DIRECTION_TOTAL
+
+    forward_masks = _run_track_subprocess(
+        video_path,
+        np.asarray(first_frame_mask),
+        model_cache_dir,
+        requested_device=device,
+        direction="forward",
+    )
+
+    total_frames = len(forward_masks)
+    if total_frames > BACKWARD_TRACKING_MAX_FRAMES:
+        # Backward tracking doubles tracking time; not worth it on long videos.
+        log.info(
+            "skipping_backward_tracking_long_video",
+            total_frames=total_frames,
+            max_frames=BACKWARD_TRACKING_MAX_FRAMES,
+        )
+        TRACKING_DIRECTION_TOTAL.labels(direction="forward_only_long_video").inc()
+        return forward_masks
+
+    try:
+        last_mask = forward_masks[-1]
+        if not np.any(last_mask > 127):
+            # Nothing to seed the reverse pass with — the object left the frame
+            # (or was never found) by the last frame.
+            log.info("skipping_backward_tracking_empty_last_mask", total_frames=total_frames)
+            TRACKING_DIRECTION_TOTAL.labels(direction="forward_only_empty_seed").inc()
+            return forward_masks
+
+        backward_masks = run_backward_tracking(video_path, last_mask, model_cache_dir)
+
+        if backward_masks.shape != forward_masks.shape:
+            # A re-encode that drops or duplicates a frame would silently
+            # misalign every mask, so refuse the consensus rather than guess.
+            raise RuntimeError(
+                f"backward masks {backward_masks.shape} do not match "
+                f"forward masks {forward_masks.shape}"
+            )
+
+        consensus_masks, reliability = compute_mask_consensus(forward_masks, backward_masks)
+
+        unreliable = int((reliability < MEDIUM_CONFIDENCE_IOU).sum())
+        TRACKING_CONSENSUS_IOU.observe(float(reliability.mean()))
+        TRACKING_DIRECTION_TOTAL.labels(direction="bidirectional").inc()
+        log.info(
+            "bidirectional_tracking_complete",
+            unreliable_frames=unreliable,
+            mean_iou=round(float(reliability.mean()), 4),
+            min_iou=round(float(reliability.min()), 4),
+            total_frames=total_frames,
+        )
+        return consensus_masks
+
+    except Exception as exc:
+        log.warning("backward_tracking_failed_using_forward", error=str(exc))
+        TRACKING_DIRECTION_TOTAL.labels(direction="forward_only_failed").inc()
+        return forward_masks
+
+
+def run_backward_tracking(
+    video_path: str,
+    last_frame_mask: "np.ndarray",
+    model_cache_dir: str,
+) -> "np.ndarray":
+    """Track the object from the last frame back to the first.
+
+    The video is reversed with ffmpeg and tracked exactly like the forward
+    pass, seeded with the forward pass's final mask; the resulting masks are
+    flipped back into original frame order before returning.
+
+    Returns (T, H, W) uint8 masks in the same tracking geometry as the
+    forward pass.
+    """
+    import subprocess
+
+    work_dir = tempfile.mkdtemp(prefix="sam2vp_rev_")
+    try:
+        reversed_path = os.path.join(work_dir, "reversed.mp4")
+        started = time.perf_counter()
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vf", "reverse",
+                "-an",                      # audio is irrelevant and areverse is costly
+                "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+                "-pix_fmt", "yuv420p",
+                reversed_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=FFMPEG_REVERSE_TIMEOUT_SEC,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg reverse failed (rc={proc.returncode}):\n{proc.stderr[-1000:]}"
+            )
+        log.info(
+            "video_reversed",
+            elapsed_sec=round(time.perf_counter() - started, 2),
+            size_mb=round(os.path.getsize(reversed_path) / 1e6, 2),
+        )
+
+        backward = _run_track_subprocess(
+            reversed_path,
+            _strip_tracking_padding(last_frame_mask, reversed_path),
+            model_cache_dir,
+            requested_device="cuda",
+            direction="backward",
+        )
+        # Masks come back in reversed-video order; put them back on the
+        # original timeline. .copy() because the negative stride view would
+        # otherwise be passed on to cv2/np.save.
+        return backward[::-1].copy()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def compute_mask_consensus(
+    forward_masks: "np.ndarray",
+    backward_masks: "np.ndarray",
+) -> tuple["np.ndarray", "np.ndarray"]:
+    """Reconcile the forward and backward masks frame by frame.
+
+    IoU >= 0.85: accept the intersection (high confidence — both passes agree,
+                 so the intersection trims tracking bleed without losing object)
+    IoU 0.65-0.85: accept the union (medium confidence, OIV validates later)
+    IoU < 0.65: unreliable — keep the forward mask and flag it via the score
+
+    Returns: consensus_masks (T, H, W) uint8 0/255
+             reliability_scores (T,) float32 — the per-frame IoU
+    """
+    T = len(forward_masks)
+    consensus = np.zeros_like(forward_masks)
+    reliability = np.zeros(T, dtype=np.float32)
+
+    for t in range(T):
+        fwd = (forward_masks[t] > 127).astype(np.uint8)
+        bwd = (backward_masks[t] > 127).astype(np.uint8)
+
+        intersection = int((fwd & bwd).sum())
+        union = int((fwd | bwd).sum())
+
+        # Both passes agree the object is absent — perfect agreement, not a
+        # divide-by-zero.
+        iou = 1.0 if union == 0 else intersection / union
+        reliability[t] = float(iou)
+
+        if iou >= HIGH_CONFIDENCE_IOU:
+            consensus[t] = (fwd & bwd) * 255
+        elif iou >= MEDIUM_CONFIDENCE_IOU:
+            consensus[t] = (fwd | bwd) * 255
+        else:
+            consensus[t] = forward_masks[t]
+
+    return consensus, reliability
+
+
+def _strip_tracking_padding(mask: "np.ndarray", video_path: str) -> "np.ndarray":
+    """Undo _track's bottom/right %8 padding so the mask can re-seed a new pass.
+
+    Tracked masks come back at (proc_h + pad_h, proc_w + pad_w). Handing that
+    straight back to _resize_and_pad_mask would resize it down to
+    (proc_h, proc_w) and then pad again, squashing the mask by up to 7px.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if src_w <= 0 or src_h <= 0:
+        return mask
+
+    proc_w, proc_h, pad_w, pad_h, _ = _processing_geometry(src_w, src_h)
+    if (pad_w or pad_h) and mask.shape[:2] == (proc_h + pad_h, proc_w + pad_w):
+        return np.ascontiguousarray(mask[:proc_h, :proc_w])
+    return mask
+
+
+def _run_track_subprocess(
+    video_path: str,
+    seed_mask: "np.ndarray",
+    model_cache_dir: str,
+    requested_device: str = "cuda",
+    direction: str = "forward",
+) -> "np.ndarray":
     """Run _track() in a fresh subprocess so CUDA can initialize.
 
     The caller's device argument (settings.device, "cpu" in .env) is
     overridden: CUDA is always requested when available, and the subprocess
     re-checks in its own fresh process, which is the only trustworthy place.
-    on_progress is accepted for signature compatibility but not forwarded —
-    callables can't cross the process boundary. Per-frame progress appears
-    only in the relayed subprocess logs.
+    on_progress is not forwarded — callables can't cross the process boundary.
+    Per-frame progress appears only in the relayed subprocess logs.
     """
     import pickle
     import subprocess
@@ -111,7 +316,7 @@ def track_with_sam2_video_predictor(
             pickle.dump(
                 {
                     "video_path": video_path,
-                    "first_frame_mask": np.asarray(first_frame_mask),
+                    "first_frame_mask": np.asarray(seed_mask),
                     "model_cache_dir": model_cache_dir,
                     "device": _forced_device,
                 },
@@ -131,7 +336,8 @@ def track_with_sam2_video_predictor(
             "sam2_vp_subprocess_started",
             video_path=video_path,
             device=_forced_device,
-            requested_device=device,
+            requested_device=requested_device,
+            direction=direction,
         )
         result = subprocess.run(
             [sys.executable, runner_path, input_path, output_path],
@@ -172,6 +378,7 @@ def track_with_sam2_video_predictor(
         log.info(
             "sam2_vp_subprocess_complete",
             num_frames=len(tracked),
+            direction=direction,
             elapsed_sec=round(time.perf_counter() - started, 2),
             subprocess_logs=sub_logs[-2000:],
         )

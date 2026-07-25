@@ -26,9 +26,9 @@ class TestMetricsImport:
         assert m.UPLOAD_URL_REQUESTS_TOTAL is not None
 
     def test_metric_count_matches_expected(self):
-        """Catches accidental removal of a metric — there must be exactly 34."""
+        """Catches accidental removal of a metric — there must be exactly 39."""
         public = [v for k, v in vars(m).items() if k.isupper() and not k.startswith("_")]
-        assert len(public) == 34, f"Expected 34 metrics, found {len(public)}: {[k for k in vars(m) if k.isupper()]}"
+        assert len(public) == 39, f"Expected 39 metrics, found {len(public)}: {[k for k in vars(m) if k.isupper()]}"
 
 
 # ── Naming convention ─────────────────────────────────────────────────────────

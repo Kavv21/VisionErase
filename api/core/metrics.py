@@ -171,6 +171,36 @@ INPAINT_ROI_COVERAGE = Histogram(
     buckets=[0.01, 0.05, 0.1, 0.2, 0.35, 0.5, 0.6, 0.8, 1.0],
 )
 
+BACKGROUND_PLATE_COVERAGE = Histogram(
+    "visionerase_background_plate_coverage_ratio",
+    "Fraction of the frame recoverable from real pixels in other frames",
+    buckets=[0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 1.0],
+)
+
+TRACKING_CONSENSUS_IOU = Histogram(
+    "visionerase_tracking_consensus_iou",
+    "Mean per-frame IoU between the forward and backward SAM2 tracking passes",
+    buckets=[0.3, 0.5, 0.65, 0.75, 0.85, 0.9, 0.95, 0.99, 1.0],
+)
+
+TRACKING_DIRECTION_TOTAL = Counter(
+    "visionerase_tracking_direction_total",
+    "Tracking runs by direction actually used (bidirectional vs forward-only)",
+    ["direction"],
+)
+
+SECOND_PASS_TOTAL = Counter(
+    "visionerase_inpaint_second_pass_total",
+    "Defect-only second ProPainter pass decisions by outcome",
+    ["outcome"],
+)
+
+SECOND_PASS_DEFECT_RATIO = Histogram(
+    "visionerase_inpaint_defect_ratio",
+    "Defective fraction of the inpainted mask area after post-processing",
+    buckets=[0.01, 0.05, 0.1, 0.15, 0.25, 0.4, 0.6, 1.0],
+)
+
 CHUNK_DIFFICULTY_SCORE = Histogram(
     "visionerase_chunk_difficulty_score",
     "Heuristic difficulty of a chunk for ProPainter (0-1); drives DiffuEraser",

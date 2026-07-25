@@ -12,6 +12,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from api.core.config import get_settings
 from api.core.metrics import (
+    BACKGROUND_PLATE_COVERAGE,
     CHUNK_DIFFICULTY_SCORE,
     DIFFUERASER_SECONDS,
     INPAINT_POSTPROCESS_SECONDS,
@@ -21,6 +22,11 @@ from api.core.metrics import (
 )
 from api.core.redis import acquire_redis, publish_progress, set_job_status
 from workers.celery_app import celery_app
+from workers.inpainting.background_plate import (
+    PLATE_CONFIDENCE_THRESHOLD,
+    apply_background_plate,
+    build_background_plate,
+)
 from workers.inpainting.tasks import (
     MODAL_MIN_HEIGHT,
     MODAL_MIN_WIDTH,
@@ -58,10 +64,28 @@ GRAIN_STRENGTH = 0.6
 # generated content, which is the point of the three-zone blend.
 INPAINT_MASK_MARGIN_PX = 28
 
+# Below this recoverable fraction *of the hole* the background plate is not
+# worth compositing: a handful of scattered pixels cannot beat ProPainter's fill
+# and only risks seams where the two meet. Measured on Wimbledon, a chunk where
+# the plate genuinely helps recovers 18-53% of the hole, so this is a floor and
+# not a tuning knob.
+MIN_PLATE_COVERAGE = 0.05
+
 # How far past the mask the post-processing stages can reach: the widest core
 # (12px) plus the transition band (16px) plus the 61px colour/grain ring kernel.
 # 96 leaves headroom on all three.
 POSTPROCESS_MARGIN_PX = 96
+
+# Defect-only second ProPainter pass. After post-processing, the finished chunk
+# is measured against the originals for the two failure modes ProPainter
+# actually produces: a colour step at the hole boundary, and a smeared fill with
+# no texture. Only the pixels that fail get re-generated.
+DEFECT_COLOUR_THRESHOLD = 15.0    # mean |RGB| delta across the mask boundary ring
+DEFECT_VARIANCE_THRESHOLD = 20.0  # mean |Laplacian| inside the mask
+SECOND_PASS_MIN_RATIO = 0.05      # below this the defect is not worth a second pass
+SECOND_PASS_MAX_RATIO = 0.25      # above this a second pass is slow and likely worse
+SECOND_PASS_MASK_MARGIN_PX = 12   # ProPainter needs slack around what it regenerates
+SECOND_PASS_FEATHER_SIGMA = 3.0   # soften the defect edge so the repair has no seam
 
 
 def compute_chunk_difficulty(
@@ -347,12 +371,79 @@ def make_grain_noise(shape: tuple[int, int], seed: int | None = None) -> Any:
     return noise / max(float(noise.std()), 1e-6)
 
 
+def detect_inpainting_defects(
+    original_frames: list[np.ndarray],
+    inpainted_frames: list[np.ndarray],
+    masks: Any,
+    threshold_colour: float = DEFECT_COLOUR_THRESHOLD,
+    threshold_variance: float = DEFECT_VARIANCE_THRESHOLD,
+) -> list[np.ndarray]:
+    """Find the regions a finished chunk got visibly wrong.
+
+    Two signals, both cheap and both matching a failure mode that is actually
+    visible in the output:
+
+      1. Boundary colour discontinuity — the fill sits at a different level from
+         the frame around it, so the hole reads as a patch. Measured on a ring
+         straddling the mask edge; when it fails, the band just inside the mask
+         is marked.
+      2. Low texture variance — the fill is a smear with no detail, which reads
+         as a blur even when the colour matches. Measured as mean |Laplacian|
+         inside the mask; when it fails, the whole masked region is marked.
+
+    Frames are RGB (as everywhere in this module); the colour test is
+    channel-order agnostic and the variance test uses the RGB→grey conversion.
+
+    Returns: list of (H, W) uint8 masks, 0 or 255, always a subset of `masks`.
+    """
+    import cv2
+
+    defect_masks: list[np.ndarray] = []
+
+    for orig, inp, mask in zip(original_frames, inpainted_frames, masks):
+        mask_binary = (mask > 127).astype(np.uint8)
+        H, W = mask.shape[:2]
+        defect = np.zeros((H, W), dtype=np.uint8)
+
+        if mask_binary.sum() == 0:
+            defect_masks.append(defect)
+            continue
+
+        # 1. Boundary colour discontinuity
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        boundary = cv2.dilate(mask_binary, kernel) - cv2.erode(mask_binary, kernel)
+
+        if boundary.sum() > 0:
+            orig_boundary = orig[boundary > 0].astype(float)
+            inp_boundary = inp[boundary > 0].astype(float)
+            colour_diff = np.abs(orig_boundary - inp_boundary).mean(axis=1)
+            if colour_diff.mean() > threshold_colour:
+                # Expand the ring inward; clipped to the mask so the defect
+                # region never reaches pixels ProPainter did not generate.
+                defect_region = cv2.dilate(boundary, kernel, iterations=2)
+                defect = np.maximum(defect, (defect_region * mask_binary) * 255)
+
+        # 2. Low texture variance (smeared/blurry fill)
+        inp_gray = cv2.cvtColor(inp, cv2.COLOR_RGB2GRAY).astype(float)
+        local_var = np.abs(cv2.Laplacian(inp_gray, cv2.CV_64F))
+
+        inside_mask = mask_binary > 0
+        if local_var[inside_mask].mean() < threshold_variance:
+            defect = np.maximum(defect, mask_binary * 255)
+
+        defect_masks.append(defect)
+
+    return defect_masks
+
+
 @celery_app.task(
     bind=True,
     queue="inpainting",
     max_retries=2,
-    soft_time_limit=600,
-    time_limit=720,
+    # Doubled from 600s: the defect-only second pass adds a whole extra
+    # ProPainter call to the worst-case chunk.
+    soft_time_limit=1200,
+    time_limit=1320,
     name="workers.inpainting.chunk_tasks.inpaint_chunk",
 )
 def inpaint_chunk(
@@ -372,8 +463,9 @@ def inpaint_chunk(
 
     The quality pipeline runs in a fixed order — each stage assumes the previous
     one has already happened:
-      ROI crop → ProPainter → ROI composite → three-zone alpha →
-      Lab colour correction → grain restoration
+      ROI crop → ProPainter → ROI composite → background plate recovery →
+      three-zone alpha → Lab colour correction → grain restoration →
+      defect-only second ProPainter pass
 
     Once every chunk's inpainting has completed (tracked via an atomic Redis
     counter), triggers stitch_all_chunks to assemble the final video.
@@ -507,9 +599,16 @@ def inpaint_chunk(
             else:
                 inpainted_frames = comp_frames
 
+            _apply_background_plates(inpainted_frames, frames, masks, bound_log)
+
             _report_progress(85)
             final_frames = _postprocess_chunk(
                 inpainted_frames, frames, masks, chunk_index, bound_log
+            )
+
+            final_frames = _maybe_second_pass(
+                final_frames, frames, masks, (x1, y1, x2, y2), use_roi,
+                use_modal, fps, settings, bound_log,
             )
 
             difficulty = compute_chunk_difficulty(frames, masks, final_frames)
@@ -760,6 +859,182 @@ def _postprocess_chunk(
         elapsed_sec=round(elapsed, 2),
     )
     return out
+
+
+def _apply_background_plates(
+    inpainted_frames: list[np.ndarray],
+    frames: list[np.ndarray],
+    masks: np.ndarray,
+    bound_log: Any,
+) -> None:
+    """Replace ProPainter's guess with real background pixels where they exist.
+
+    Runs before the three-zone blend, colour correction and grain restoration so
+    those stages treat the recovered pixels exactly like any other fill — the
+    plate is composited only inside the mask, so the alpha ramp and the ring
+    statistics downstream see the same geometry either way.
+
+    Mutates inpainted_frames in place; frames stay RGB throughout.
+    """
+    started = time.perf_counter()
+    plates_applied = 0
+
+    for i in range(len(inpainted_frames)):
+        plate, confidence = build_background_plate(
+            frames=frames,
+            masks=masks,
+            target_idx=i,
+        )
+        # Coverage is measured against the hole, not the frame. The object is
+        # only 1-5% of a 1080p frame here, so a whole-frame denominator can
+        # never clear MIN_PLATE_COVERAGE and the plate would never fire.
+        hole = masks[i] > 127
+        recovered = confidence >= PLATE_CONFIDENCE_THRESHOLD
+        coverage = float(recovered[hole].mean()) if hole.any() else 0.0
+        BACKGROUND_PLATE_COVERAGE.observe(coverage)
+        if coverage > MIN_PLATE_COVERAGE:
+            inpainted_frames[i] = apply_background_plate(
+                orig=frames[i],
+                propainter=inpainted_frames[i],
+                mask=masks[i],
+                plate=plate,
+                confidence=confidence,
+            )
+            plates_applied += 1
+
+    bound_log.info(
+        "background_plate_recovery",
+        frames_improved=plates_applied,
+        total_frames=len(inpainted_frames),
+        elapsed_sec=round(time.perf_counter() - started, 2),
+    )
+
+
+def _maybe_second_pass(
+    final_frames: list[np.ndarray],
+    originals: list[np.ndarray],
+    masks: np.ndarray,
+    roi: tuple[int, int, int, int],
+    use_roi: bool,
+    use_modal: bool,
+    fps: float,
+    settings: Any,
+    bound_log: Any,
+) -> list[np.ndarray]:
+    """Re-inpaint only the pixels the first pass got wrong, if there are any.
+
+    ProPainter is re-run on the *original* frames with the defect regions as the
+    hole, then only those pixels are taken from the result. Feeding it the
+    originals rather than the finished chunk keeps the second pass from
+    compounding the first pass's mistakes.
+
+    Best-effort like DiffuEraser refinement: any failure leaves the first-pass
+    result in place rather than failing the chunk.
+    """
+    import cv2
+
+    from api.core.metrics import SECOND_PASS_DEFECT_RATIO, SECOND_PASS_TOTAL
+
+    defect_masks = detect_inpainting_defects(originals, final_frames, masks)
+
+    # Areas in pixels, not summed 0/255 values — a defect mask stores 255 per
+    # pixel while the reference mask is counted as a boolean, so summing raw
+    # values would inflate the ratio 255x and never let a second pass run.
+    total_defect_area = sum(int((d > 0).sum()) for d in defect_masks)
+    total_mask_area = sum(int((m > 127).sum()) for m in masks)
+    defect_ratio = total_defect_area / (total_mask_area + 1)
+
+    SECOND_PASS_DEFECT_RATIO.observe(defect_ratio)
+    bound_log.info(
+        "defect_detection",
+        defect_ratio=round(float(defect_ratio), 3),
+        needs_second_pass=defect_ratio > SECOND_PASS_MIN_RATIO,
+    )
+
+    if defect_ratio >= SECOND_PASS_MAX_RATIO:
+        # Too much of the fill is bad for a targeted repair to help: the pass
+        # would cost as much as the first one and is as likely to make it worse.
+        SECOND_PASS_TOTAL.labels(outcome="high_defect_ratio").inc()
+        bound_log.warning(
+            "high_defect_ratio_skipping_second_pass",
+            defect_ratio=round(float(defect_ratio), 3),
+        )
+        return final_frames
+
+    if defect_ratio <= SECOND_PASS_MIN_RATIO:
+        SECOND_PASS_TOTAL.labels(outcome="not_needed").inc()
+        return final_frames
+
+    started = time.perf_counter()
+    try:
+        x1, y1, x2, y2 = roi
+        defect_stack = np.stack(defect_masks)
+        if use_roi:
+            proc_frames = [np.ascontiguousarray(f[y1:y2, x1:x2]) for f in originals]
+            proc_defects = np.ascontiguousarray(defect_stack[:, y1:y2, x1:x2])
+        else:
+            proc_frames = originals
+            proc_defects = defect_stack
+
+        # Same reason as INPAINT_MASK_MARGIN_PX on the first pass: ProPainter
+        # composites against a mask dilated by only ~4px, so the region we
+        # actually take pixels from has to sit well inside what it regenerated.
+        gen_masks = _dilate_masks(proc_defects, SECOND_PASS_MASK_MARGIN_PX)
+
+        if use_modal:
+            video_bytes = _run_modal_inpainting(
+                _encode_frames_jpeg(proc_frames), _encode_masks_png(gen_masks), fps
+            )
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+                tmp_file.write(video_bytes)
+                second_path = tmp_file.name
+            try:
+                second = _decode_video_frames(second_path)
+            finally:
+                os.unlink(second_path)
+        else:
+            second = _run_propainter_inpainting(
+                proc_frames, gen_masks, settings, bound_log, lambda _pct: None
+            )
+
+        second = _align_to_reference(second, proc_frames, bound_log)
+
+        out: list[np.ndarray] = []
+        for prior, patch, defect in zip(final_frames, second, defect_masks):
+            if defect.max() == 0:
+                out.append(prior)
+                continue
+            if use_roi:
+                full = prior.copy()
+                full[y1:y2, x1:x2] = patch
+                patch = full
+            # Feathered rather than the hard defect edge: a binary cut would
+            # butt second-pass pixels against first-pass ones and reintroduce
+            # exactly the seam the three-zone blend exists to avoid.
+            alpha = cv2.GaussianBlur(
+                (defect > 0).astype(np.float32), (0, 0), SECOND_PASS_FEATHER_SIGMA
+            )[:, :, None]
+            out.append(
+                (alpha * patch.astype(np.float32) + (1 - alpha) * prior.astype(np.float32))
+                .clip(0, 255).astype(np.uint8)
+            )
+
+        SECOND_PASS_TOTAL.labels(outcome="repaired").inc()
+        bound_log.info(
+            "second_pass_complete",
+            defect_ratio=round(float(defect_ratio), 3),
+            elapsed_sec=round(time.perf_counter() - started, 2),
+        )
+        return out
+
+    except Exception as exc:
+        SECOND_PASS_TOTAL.labels(outcome="failed").inc()
+        bound_log.warning(
+            "second_pass_failed_skipping",
+            error=str(exc),
+            elapsed_sec=round(time.perf_counter() - started, 2),
+        )
+        return final_frames
 
 
 def _maybe_refine_with_diffueraser(
