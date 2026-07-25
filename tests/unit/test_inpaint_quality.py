@@ -329,3 +329,55 @@ class TestAlignToReference:
         shrunk = [cv2.resize(f, (W // 2, H // 2)) for f in frames]
         aligned = ct._align_to_reference(shrunk, frames, _NullLog())
         assert all(f.shape == frames[0].shape for f in aligned)
+
+
+# ── Chunk difficulty scoring (drives DiffuEraser refinement) ──────────────────
+
+@pytest.mark.unit
+class TestComputeChunkDifficulty:
+    def test_score_is_in_unit_range(self, clip):
+        frames, masks = clip
+        inpainted = [cv2.GaussianBlur(f, (0, 0), 3.0) for f in frames]
+        score = ct.compute_chunk_difficulty(frames, masks, inpainted)
+        assert isinstance(score, float) and 0.0 <= score <= 1.0
+
+    def test_perfect_reconstruction_scores_lower_than_a_bad_one(self, clip):
+        """The boundary term must reward a result that matches its surroundings."""
+        frames, masks = clip
+        identical = [f.copy() for f in frames]
+        garbage = [np.zeros_like(f) for f in frames]
+        assert ct.compute_chunk_difficulty(
+            frames, masks, identical
+        ) < ct.compute_chunk_difficulty(frames, masks, garbage)
+
+    def test_larger_masks_score_higher(self, clip):
+        frames, masks = clip
+        big = np.zeros_like(masks)
+        big[:, 100:400, 100:600] = 255
+        inpainted = [f.copy() for f in frames]
+        assert ct.compute_chunk_difficulty(
+            frames, big, inpainted
+        ) > ct.compute_chunk_difficulty(frames, masks, inpainted)
+
+    def test_empty_masks_do_not_crash(self, clip):
+        """A chunk the object has left must score without dividing by zero."""
+        frames, masks = clip
+        score = ct.compute_chunk_difficulty(
+            frames, np.zeros_like(masks), [f.copy() for f in frames]
+        )
+        assert 0.0 <= score <= 1.0
+
+    def test_textured_region_scores_above_flat_region(self):
+        """Entropy term: a flat wall is easier to fill than dense texture."""
+        rng = np.random.default_rng(1)
+        mask = np.zeros((H, W), np.uint8)
+        mask[200:300, 300:400] = 255
+        masks = np.stack([mask] * 3)
+
+        flat = [np.full((H, W, 3), 128, np.uint8) for _ in range(3)]
+        textured = [
+            rng.integers(0, 256, (H, W, 3), dtype=np.uint8) for _ in range(3)
+        ]
+        assert ct.compute_chunk_difficulty(
+            textured, masks, [f.copy() for f in textured]
+        ) > ct.compute_chunk_difficulty(flat, masks, [f.copy() for f in flat])

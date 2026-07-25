@@ -81,6 +81,14 @@ class Settings(BaseSettings):
     # Modal high-resolution inpainting
     modal_enabled: bool = True
 
+    # DiffuEraser diffusion refinement — a second pass over chunks ProPainter
+    # found hard, using its output as the diffusion prior. Off by default: it
+    # roughly doubles per-chunk cost, so it stays opt-in until measured to pay
+    # for itself on a given workload.
+    diffueraser_enabled: bool = False
+    diffueraser_threshold: float = 0.5  # refine chunks scoring above this
+    diffueraser_max_img_size: int = 960  # longest side; 960x540 ≈ 20GB VRAM
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -12,6 +12,8 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from api.core.config import get_settings
 from api.core.metrics import (
+    CHUNK_DIFFICULTY_SCORE,
+    DIFFUERASER_SECONDS,
     INPAINT_POSTPROCESS_SECONDS,
     INPAINT_ROI_COVERAGE,
     INPAINT_ROI_MODE_TOTAL,
@@ -60,6 +62,58 @@ INPAINT_MASK_MARGIN_PX = 28
 # (12px) plus the transition band (16px) plus the 61px colour/grain ring kernel.
 # 96 leaves headroom on all three.
 POSTPROCESS_MARGIN_PX = 96
+
+
+def compute_chunk_difficulty(
+    frames: list[np.ndarray],
+    masks: Any,
+    inpainted_frames: list[np.ndarray],
+) -> float:
+    """Score how hard this chunk was for ProPainter, in [0, 1].
+
+    Higher means more likely to benefit from DiffuEraser's diffusion
+    refinement. Combines three cheap signals: how much of the frame the mask
+    covers, how textured the region being replaced is, and how far the
+    inpainted pixels ended up from the originals around the mask edge.
+
+    Frames are RGB, matching the rest of this module.
+    """
+    import cv2
+
+    scores: list[float] = []
+
+    # 1. Mask area ratio — large holes leave ProPainter less to copy from
+    mask_coverage = float(np.mean([m.mean() / 255.0 for m in masks]))
+    scores.append(min(mask_coverage * 3.0, 1.0))
+
+    # 2. Texture entropy inside the mask — flat regions are easy to fill
+    entropies: list[float] = []
+    for frame, mask in zip(frames, masks):
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        masked_region = gray[mask > 127]
+        if len(masked_region) > 100:
+            hist = np.histogram(masked_region, bins=32, range=(0, 256))[0]
+            hist = hist / (hist.sum() + 1e-8)
+            entropy = -np.sum(hist * np.log2(hist + 1e-8))
+            entropies.append(entropy / 5.0)  # 5 bits ≈ max for 32 bins
+    if entropies:
+        scores.append(min(float(np.mean(entropies)), 1.0))
+
+    # 3. How far the result moved from the original around the mask edge
+    discontinuities: list[float] = []
+    for orig, inp, mask in zip(frames, inpainted_frames, masks):
+        mask_binary = (mask > 127).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        boundary = cv2.dilate(mask_binary, kernel) - cv2.erode(mask_binary, kernel)
+        if boundary.sum() > 0:
+            orig_boundary = orig[boundary > 0].astype(float)
+            inp_boundary = inp[boundary > 0].astype(float)
+            diff = np.abs(orig_boundary - inp_boundary).mean() / 255.0
+            discontinuities.append(diff)
+    if discontinuities:
+        scores.append(min(float(np.mean(discontinuities)) * 5.0, 1.0))
+
+    return float(np.mean(scores)) if scores else 0.0
 
 
 def compute_roi_crop(
@@ -458,6 +512,21 @@ def inpaint_chunk(
                 inpainted_frames, frames, masks, chunk_index, bound_log
             )
 
+            difficulty = compute_chunk_difficulty(frames, masks, final_frames)
+            CHUNK_DIFFICULTY_SCORE.observe(difficulty)
+            bound_log.info(
+                "chunk_difficulty_score",
+                chunk_index=chunk_index,
+                difficulty=round(difficulty, 3),
+            )
+
+            refined = _maybe_refine_with_diffueraser(
+                final_frames, frames, masks, difficulty, fps, settings, bound_log
+            )
+            if refined is not None:
+                final_frames = refined
+                status = f"{status}_diffueraser"
+
             _write_chunk_video(final_frames, output_path, fps)
             s3.upload_file(output_path, settings.s3_bucket, output_key)
 
@@ -691,6 +760,113 @@ def _postprocess_chunk(
         elapsed_sec=round(elapsed, 2),
     )
     return out
+
+
+def _maybe_refine_with_diffueraser(
+    inpainted: list[np.ndarray],
+    originals: list[np.ndarray],
+    masks: np.ndarray,
+    difficulty: float,
+    fps: float,
+    settings: Any,
+    bound_log: Any,
+) -> list[np.ndarray] | None:
+    """Run DiffuEraser over a hard chunk, or return None to keep ProPainter's.
+
+    Refinement is strictly best-effort: any failure — disabled flag, too-short
+    chunk, Modal error, wrong frame count back — leaves the ProPainter result
+    in place rather than failing the chunk. A refinement pass is an
+    optimisation, never a dependency.
+    """
+    import cv2
+
+    from api.core.metrics import DIFFUERASER_REFINEMENTS_TOTAL
+
+    if not getattr(settings, "diffueraser_enabled", False):
+        return None
+    if difficulty <= settings.diffueraser_threshold:
+        DIFFUERASER_REFINEMENTS_TOTAL.labels(outcome="below_threshold").inc()
+        return None
+
+    from pipeline.modal_diffueraser import MIN_FRAMES
+
+    if len(inpainted) < MIN_FRAMES:
+        # DiffuEraser raises below this; skip rather than pay for a container.
+        bound_log.info("diffueraser_skipped_short_chunk", num_frames=len(inpainted))
+        DIFFUERASER_REFINEMENTS_TOTAL.labels(outcome="too_short").inc()
+        return None
+
+    started = time.perf_counter()
+    try:
+        bound_log.info("diffueraser_refinement_started", difficulty=round(difficulty, 3))
+
+        def _jpeg(frame_rgb):
+            bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            return cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+
+        frames_bytes = [_jpeg(f) for f in originals]
+        masks_bytes = [cv2.imencode(".png", m)[1].tobytes() for m in masks]
+        prior_bytes = [_jpeg(f) for f in inpainted]
+
+        import modal
+
+        fn = modal.Function.from_name("visionerase-diffueraser", "refine_with_diffueraser")
+        video_bytes = fn.remote(
+            frames_bytes,
+            masks_bytes,
+            prior_bytes,
+            fps=fps,
+            max_img_size=settings.diffueraser_max_img_size,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+            tmp_file.write(video_bytes)
+            refined_path = tmp_file.name
+        try:
+            refined = _decode_video_frames(refined_path)
+        finally:
+            os.unlink(refined_path)
+
+        if len(refined) != len(inpainted):
+            raise RuntimeError(
+                f"DiffuEraser returned {len(refined)} frames, expected {len(inpainted)}"
+            )
+
+        # Keep the refinement inside the hole. DiffuEraser works at
+        # max_img_size and its whole frame comes back through a downscale and
+        # back up, so adopting it wholesale would soften every pixel we never
+        # asked it to touch.
+        composited = []
+        for prior, ref, mask in zip(inpainted, refined, masks):
+            if ref.shape[:2] != prior.shape[:2]:
+                ref = cv2.resize(
+                    ref, (prior.shape[1], prior.shape[0]), interpolation=cv2.INTER_LANCZOS4
+                )
+            alpha = create_three_zone_mask(mask)[:, :, None]
+            composited.append(
+                (alpha * ref.astype(np.float32) + (1 - alpha) * prior.astype(np.float32))
+                .clip(0, 255).astype(np.uint8)
+            )
+        refined = composited
+
+        elapsed = time.perf_counter() - started
+        DIFFUERASER_SECONDS.observe(elapsed)
+        DIFFUERASER_REFINEMENTS_TOTAL.labels(outcome="refined").inc()
+        bound_log.info(
+            "diffueraser_refinement_complete",
+            num_frames=len(refined),
+            elapsed_sec=round(elapsed, 1),
+        )
+        return refined
+
+    except Exception as exc:
+        DIFFUERASER_REFINEMENTS_TOTAL.labels(outcome="failed").inc()
+        bound_log.warning(
+            "diffueraser_failed_fallback_propainter",
+            error=str(exc),
+            elapsed_sec=round(time.perf_counter() - started, 1),
+        )
+        return None
 
 
 def _postprocess_box(

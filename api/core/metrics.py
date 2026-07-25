@@ -171,6 +171,24 @@ INPAINT_ROI_COVERAGE = Histogram(
     buckets=[0.01, 0.05, 0.1, 0.2, 0.35, 0.5, 0.6, 0.8, 1.0],
 )
 
+CHUNK_DIFFICULTY_SCORE = Histogram(
+    "visionerase_chunk_difficulty_score",
+    "Heuristic difficulty of a chunk for ProPainter (0-1); drives DiffuEraser",
+    buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.85, 1.0],
+)
+
+DIFFUERASER_REFINEMENTS_TOTAL = Counter(
+    "visionerase_diffueraser_refinements_total",
+    "DiffuEraser refinement attempts by outcome",
+    ["outcome"],
+)
+
+DIFFUERASER_SECONDS = Histogram(
+    "visionerase_diffueraser_seconds",
+    "Wall time of one DiffuEraser refinement pass, including Modal transfer",
+    buckets=[30, 60, 120, 180, 300, 450, 600, 900],
+)
+
 INPAINT_POSTPROCESS_SECONDS = Histogram(
     "visionerase_inpaint_postprocess_seconds",
     "Time spent on three-zone blending, colour correction and grain per chunk",
